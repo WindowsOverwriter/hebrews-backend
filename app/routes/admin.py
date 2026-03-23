@@ -1,13 +1,14 @@
 import os
 from functools import wraps
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 import bcrypt
 import jwt
 from flask import Blueprint, jsonify, request, current_app
 
-from app import db
-from app.models import Order, Drink, CustomizationOption, Setting, ActivePeriod
+from sqlalchemy.orm import joinedload
+from app import db, limiter
+from app.models import Order, OrderItem, Drink, CustomizationOption, Setting, ActivePeriod, Location, LocationDate
 
 admin_bp = Blueprint('admin', __name__)
 
@@ -30,21 +31,14 @@ def require_auth(f):
 
 
 @admin_bp.route('/login', methods=['POST'])
+@limiter.limit("5 per minute")
 def login():
     data = request.get_json()
     if not data or not data.get('password'):
         return jsonify({'error': 'Password is required.'}), 400
 
-    admin_password = current_app.config['ADMIN_PASSWORD']
-    if not bcrypt.checkpw(
-        data['password'].encode('utf-8'),
-        bcrypt.hashpw(admin_password.encode('utf-8'), bcrypt.gensalt())
-    ):
-        # For production, compare against a stored hash instead
-        pass
-
-    # Simplified: direct comparison for development
-    if data['password'] != admin_password:
+    stored_hash = current_app.config['ADMIN_PASSWORD_HASH']
+    if not bcrypt.checkpw(data['password'].encode('utf-8'), stored_hash):
         return jsonify({'error': 'Invalid password.'}), 401
 
     token = jwt.encode(
@@ -68,6 +62,7 @@ def get_orders():
     orders = (
         Order.query
         .filter_by(period_id=period.id)
+        .options(joinedload(Order.items).joinedload(OrderItem.drink))
         .order_by(Order.pickup_slot.asc())
         .all()
     )
@@ -176,3 +171,98 @@ def update_setting():
         setting.value = value
     db.session.commit()
     return jsonify({'key': setting.key, 'value': setting.value})
+
+
+@admin_bp.route('/locations', methods=['GET'])
+@require_auth
+def get_all_locations():
+    locations = Location.query.order_by(Location.name).all()
+    return jsonify({
+        'locations': [
+            {
+                'id': loc.id,
+                'name': loc.name,
+                'address': loc.address,
+                'active': loc.active,
+                'delete_after': loc.delete_after.isoformat() if loc.delete_after else None,
+                'dates': sorted([d.date.isoformat() for d in loc.dates])
+            }
+            for loc in locations
+        ]
+    })
+
+
+@admin_bp.route('/locations', methods=['POST'])
+@require_auth
+def create_location():
+    data = request.get_json()
+    name = (data.get('name') or '').strip()
+    address = (data.get('address') or '').strip()
+    if not name or not address:
+        return jsonify({'error': 'name and address are required.'}), 400
+    location = Location(name=name, address=address)
+    db.session.add(location)
+    db.session.commit()
+    return jsonify({
+        'id': location.id,
+        'name': location.name,
+        'address': location.address,
+        'active': location.active
+    }), 201
+
+
+@admin_bp.route('/locations/<int:location_id>', methods=['PATCH'])
+@require_auth
+def update_location(location_id):
+    location = Location.query.get_or_404(location_id)
+    data = request.get_json()
+    if 'name' in data:
+        location.name = data['name'].strip()
+    if 'address' in data:
+        location.address = data['address'].strip()
+    if 'active' in data:
+        location.active = data['active']
+    if 'delete_after' in data:
+        if data['delete_after']:
+            location.delete_after = date.fromisoformat(data['delete_after'])
+        else:
+            location.delete_after = None
+    db.session.commit()
+    return jsonify({
+        'id': location.id,
+        'name': location.name,
+        'address': location.address,
+        'active': location.active,
+        'delete_after': location.delete_after.isoformat() if location.delete_after else None
+    })
+
+
+@admin_bp.route('/locations/<int:location_id>', methods=['DELETE'])
+@require_auth
+def delete_location(location_id):
+    location = Location.query.get_or_404(location_id)
+    db.session.delete(location)
+    db.session.commit()
+    return jsonify({'message': 'Location deleted.'})
+
+
+@admin_bp.route('/locations/<int:location_id>/dates', methods=['PUT'])
+@require_auth
+def set_location_dates(location_id):
+    """Replace all dates for a location with the provided list."""
+    location = Location.query.get_or_404(location_id)
+    data = request.get_json()
+    dates = data.get('dates', [])
+
+    # Clear existing dates
+    LocationDate.query.filter_by(location_id=location.id).delete()
+
+    # Add new dates
+    for d in dates:
+        loc_date = LocationDate(location_id=location.id, date=date.fromisoformat(d))
+        db.session.add(loc_date)
+
+    db.session.commit()
+    return jsonify({
+        'dates': sorted([d.date.isoformat() for d in location.dates])
+    })

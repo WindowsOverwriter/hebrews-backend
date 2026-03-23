@@ -1,6 +1,8 @@
+from datetime import date
 from flask import Blueprint, jsonify, request
-from app import db
-from app.models import Drink, CustomizationOption, Order, OrderItem, Setting, ActivePeriod
+from sqlalchemy.orm import joinedload
+from app import db, limiter
+from app.models import Drink, CustomizationOption, Order, OrderItem, Setting, ActivePeriod, Location, LocationDate
 import random
 import string
 
@@ -69,7 +71,36 @@ def _generate_confirmation_code():
             return code
 
 
+@public_bp.route('/locations', methods=['GET'])
+def get_locations():
+    today = date.today()
+    # Auto-delete expired locations
+    expired = Location.query.filter(Location.delete_after != None, Location.delete_after <= today).all()
+    for loc in expired:
+        db.session.delete(loc)
+    if expired:
+        db.session.commit()
+
+    locations = Location.query.filter_by(active=True).order_by(Location.name).all()
+    return jsonify({
+        'locations': [
+            {
+                'id': loc.id,
+                'name': loc.name,
+                'address': loc.address,
+                'dates': sorted([
+                    d.date.isoformat()
+                    for d in loc.dates
+                    if d.date >= today
+                ])
+            }
+            for loc in locations
+        ]
+    })
+
+
 @public_bp.route('/orders', methods=['POST'])
+@limiter.limit("10 per minute")
 def submit_order():
     accepting = Setting.query.get('orders_accepting')
     if accepting and not accepting.value:
@@ -86,8 +117,16 @@ def submit_order():
 
     if not customer_name or not phone_number or not pickup_slot:
         return jsonify({'error': 'customer_name, phone_number, and pickup_slot are required.'}), 400
+    if len(customer_name) > 100:
+        return jsonify({'error': 'customer_name must be 100 characters or fewer.'}), 400
+    if len(phone_number) > 20:
+        return jsonify({'error': 'phone_number must be 20 characters or fewer.'}), 400
+    if len(pickup_slot) > 20:
+        return jsonify({'error': 'pickup_slot must be 20 characters or fewer.'}), 400
     if not items:
         return jsonify({'error': 'At least one item is required.'}), 400
+    if len(items) > 20:
+        return jsonify({'error': 'Maximum 20 items per order.'}), 400
 
     period = ActivePeriod.query.filter_by(ended_at=None).first()
     if not period:
@@ -123,8 +162,14 @@ def submit_order():
 
 
 @public_bp.route('/orders/<confirmation_code>', methods=['GET'])
+@limiter.limit("15 per minute")
 def get_order(confirmation_code):
-    order = Order.query.filter_by(confirmation_code=confirmation_code.upper()).first()
+    order = (
+        Order.query
+        .filter_by(confirmation_code=confirmation_code.upper())
+        .options(joinedload(Order.items).joinedload(OrderItem.drink))
+        .first()
+    )
     if not order:
         return jsonify({'error': 'Order not found.'}), 404
 

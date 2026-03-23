@@ -1,5 +1,5 @@
 from app import db
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 
 class ActivePeriod(db.Model):
@@ -63,3 +63,28 @@ class Setting(db.Model):
 
     key = db.Column(db.String(50), primary_key=True)
     value = db.Column(db.JSON)
+
+
+class Location(db.Model):
+    __tablename__ = 'locations'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False)
+    address = db.Column(db.String(300), nullable=False)
+    active = db.Column(db.Boolean, default=True)
+    delete_after = db.Column(db.Date, nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    dates = db.relationship('LocationDate', backref='location', lazy=True, cascade='all, delete-orphan')
+
+
+class LocationDate(db.Model):
+    __tablename__ = 'location_dates'
+
+    id = db.Column(db.Integer, primary_key=True)
+    location_id = db.Column(db.Integer, db.ForeignKey('locations.id'), nullable=False)
+    date = db.Column(db.Date, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint('location_id', 'date', name='uq_location_date'),
+    )

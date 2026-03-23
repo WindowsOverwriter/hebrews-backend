@@ -1,23 +1,38 @@
 import os
+import bcrypt as _bcrypt
 from flask import Flask
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 
 load_dotenv()
 
 db = SQLAlchemy()
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
 
 
 def create_app(testing=False):
     app = Flask(__name__)
 
-    app.config['SQLALCHEMY_DATABASE_URI'] = (
-        os.environ.get('DATABASE_URL', 'sqlite:///dev.db')
-    )
+    db_url = os.environ.get('DATABASE_URL', 'sqlite:///dev.db')
+    # psycopg (v3) requires the +psycopg dialect suffix for SQLAlchemy
+    if db_url.startswith('postgresql://'):
+        db_url = db_url.replace('postgresql://', 'postgresql+psycopg://', 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['JWT_SECRET'] = os.environ.get('JWT_SECRET', 'dev-secret-change-me')
-    app.config['ADMIN_PASSWORD'] = os.environ.get('ADMIN_PASSWORD', 'admin')
+
+    # Hash the admin password once at startup for constant-time bcrypt comparison
+    admin_password = os.environ.get('ADMIN_PASSWORD', 'admin')
+    app.config['ADMIN_PASSWORD_HASH'] = _bcrypt.hashpw(
+        admin_password.encode('utf-8'), _bcrypt.gensalt()
+    )
 
     if testing:
         app.config['TESTING'] = True
@@ -29,6 +44,7 @@ def create_app(testing=False):
     CORS(app, origins=[frontend_origin])
 
     db.init_app(app)
+    limiter.init_app(app)
 
     from app.routes.public import public_bp
     from app.routes.admin import admin_bp
