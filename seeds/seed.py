@@ -6,7 +6,9 @@ from app.models import Drink, CustomizationOption, Setting, ActivePeriod
 def seed():
     app = create_app()
     with app.app_context():
-        db.create_all()
+        # Clear existing data (order matters for foreign keys)
+        db.session.execute(db.text('TRUNCATE order_items, orders, active_periods, customization_options, drinks, settings, location_dates, locations RESTART IDENTITY CASCADE'))
+        db.session.commit()
 
         # Drinks
         drinks = [
@@ -30,11 +32,10 @@ def seed():
             CustomizationOption(type='milk_type', label='Oat'),
             CustomizationOption(type='milk_type', label='Almond'),
             CustomizationOption(type='milk_type', label='Soy'),
-            CustomizationOption(type='addon', label='Extra Shot'),
-            CustomizationOption(type='addon', label='Vanilla Syrup'),
-            CustomizationOption(type='addon', label='Caramel Syrup'),
-            CustomizationOption(type='addon', label='Hazelnut Syrup'),
-            CustomizationOption(type='addon', label='Sugar-Free Vanilla'),
+            CustomizationOption(type='syrup', label='Vanilla'),
+            CustomizationOption(type='syrup', label='Caramel'),
+            CustomizationOption(type='syrup', label='Hazelnut'),
+            CustomizationOption(type='syrup', label='Sugar-Free Vanilla'),
         ]
         db.session.add_all(customizations)
 

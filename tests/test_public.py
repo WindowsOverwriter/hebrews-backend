@@ -35,7 +35,9 @@ def test_submit_order_success(client):
                 'customizations': {
                     'temperature': 'Iced',
                     'milk_type': 'Oat',
-                    'addons': ['Vanilla Syrup']
+                    'syrup': 'Vanilla',
+                    'syrup_pumps': 2,
+                    'special_instructions': 'Extra hot please'
                 }
             }
         ]

@@ -46,7 +46,7 @@ def _seed_test_data():
         CustomizationOption(type='temperature', label='Hot'),
         CustomizationOption(type='temperature', label='Iced'),
         CustomizationOption(type='milk_type', label='Oat'),
-        CustomizationOption(type='addon', label='Vanilla Syrup'),
+        CustomizationOption(type='syrup', label='Vanilla'),
     ])
 
     _db.session.add_all([
