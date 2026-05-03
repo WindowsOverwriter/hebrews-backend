@@ -1,1 +1,1 @@
-from app.models.models import ActivePeriod, Drink, CustomizationOption, Order, OrderItem, Setting, Location, LocationDate
+from app.models.models import ActivePeriod, Drink, DrinkCustomizationType, CustomizationOption, Order, OrderItem, Setting, Location, LocationDate

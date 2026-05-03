@@ -22,6 +22,20 @@ class Drink(db.Model):
     enabled = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+    customization_types = db.relationship('DrinkCustomizationType', backref='drink', lazy=True, cascade='all, delete-orphan')
+
+
+class DrinkCustomizationType(db.Model):
+    __tablename__ = 'drink_customization_types'
+
+    id = db.Column(db.Integer, primary_key=True)
+    drink_id = db.Column(db.Integer, db.ForeignKey('drinks.id'), nullable=False)
+    customization_type = db.Column(db.String(50), nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint('drink_id', 'customization_type', name='uq_drink_cust_type'),
+    )
+
 
 class CustomizationOption(db.Model):
     __tablename__ = 'customization_options'
@@ -36,15 +50,20 @@ class Order(db.Model):
     __tablename__ = 'orders'
 
     id = db.Column(db.Integer, primary_key=True)
-    confirmation_code = db.Column(db.String(10), unique=True, nullable=False)
+    order_number = db.Column(db.Integer, nullable=False)
+    confirmation_code = db.Column(db.String(12), unique=True, nullable=False)
     customer_name = db.Column(db.String(100), nullable=False)
     phone_number = db.Column(db.String(20), nullable=False)
     pickup_slot = db.Column(db.String(20), nullable=False)
-    status = db.Column(db.String(20), default='received')
+    status = db.Column(db.String(20), default='queued')
     period_id = db.Column(db.Integer, db.ForeignKey('active_periods.id'), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     items = db.relationship('OrderItem', backref='order', lazy=True, cascade='all, delete-orphan')
+
+    __table_args__ = (
+        db.UniqueConstraint('order_number', 'period_id', name='uq_order_number_period'),
+    )
 
 
 class OrderItem(db.Model):

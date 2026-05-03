@@ -44,8 +44,10 @@ def test_submit_order_success(client):
     })
     assert response.status_code == 201
     data = response.get_json()
-    assert data['confirmation_code'].startswith('HB-')
-    assert len(data['confirmation_code']) == 7
+    code = data['confirmation_code']
+    # Format: XX-YYYYYY (2-char day prefix, dash, 6 alphanumeric)
+    assert len(code) == 9
+    assert code[2] == '-'
 
 
 def test_submit_order_missing_fields(client):
@@ -81,10 +83,12 @@ def test_get_order_by_code(client):
     response = client.get(f'/api/orders/{code}')
     assert response.status_code == 200
     data = response.get_json()
-    assert data['customer_name'] == 'Jane Doe'
-    assert data['status'] == 'received'
+    # Public endpoint returns first name only, no phone number
+    assert data['customer_name'] == 'Jane'
+    assert 'phone_number' not in data
+    assert data['status'] == 'queued'
 
 
 def test_get_order_not_found(client):
-    response = client.get('/api/orders/HB-ZZZZ')
+    response = client.get('/api/orders/XX-ZZZZZZ')
     assert response.status_code == 404

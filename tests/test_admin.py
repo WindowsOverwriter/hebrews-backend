@@ -54,6 +54,12 @@ def test_orders_rejected_when_disabled(client, auth_headers):
     })
     assert response.status_code == 503
 
+    # Re-enable orders so other tests aren't affected
+    client.patch('/api/admin/settings', json={
+        'key': 'orders_accepting',
+        'value': True
+    }, headers=auth_headers)
+
 
 def test_reset_period(client, auth_headers):
     response = client.post('/api/admin/period/reset', headers=auth_headers)

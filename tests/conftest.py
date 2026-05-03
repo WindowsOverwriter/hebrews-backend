@@ -1,6 +1,6 @@
 import pytest
 from app import create_app, db as _db
-from app.models import Drink, CustomizationOption, Setting, ActivePeriod
+from app.models import Drink, DrinkCustomizationType, CustomizationOption, Setting, ActivePeriod
 
 
 @pytest.fixture
@@ -36,10 +36,17 @@ def _seed_test_data():
     """Seed minimal test data."""
     _db.session.add(ActivePeriod())
 
+    latte = Drink(name='Latte', description='Test latte', ratio_summary='75% milk, 25% espresso')
+    cold_brew = Drink(name='Cold Brew', description='Test cold brew', ratio_summary='100% cold coffee')
+    disabled = Drink(name='Disabled Drink', description='Should not appear', ratio_summary='N/A', enabled=False)
+    _db.session.add_all([latte, cold_brew, disabled])
+    _db.session.flush()
+
     _db.session.add_all([
-        Drink(name='Latte', description='Test latte', ratio_summary='75% milk, 25% espresso'),
-        Drink(name='Cold Brew', description='Test cold brew', ratio_summary='100% cold coffee'),
-        Drink(name='Disabled Drink', description='Should not appear', ratio_summary='N/A', enabled=False),
+        DrinkCustomizationType(drink_id=latte.id, customization_type='temperature'),
+        DrinkCustomizationType(drink_id=latte.id, customization_type='milk_type'),
+        DrinkCustomizationType(drink_id=latte.id, customization_type='syrup'),
+        DrinkCustomizationType(drink_id=cold_brew.id, customization_type='syrup'),
     ])
 
     _db.session.add_all([

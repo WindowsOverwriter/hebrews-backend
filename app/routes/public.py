@@ -1,10 +1,51 @@
-from datetime import date
+from datetime import date, datetime, timezone
+import logging
+import re
 from flask import Blueprint, jsonify, request
 from sqlalchemy.orm import joinedload
 from app import db, limiter
-from app.models import Drink, CustomizationOption, Order, OrderItem, Setting, ActivePeriod, Location, LocationDate
+from app.models import Drink, DrinkCustomizationType, CustomizationOption, Order, OrderItem, Setting, ActivePeriod, Location, LocationDate
 import random
 import string
+
+logger = logging.getLogger(__name__)
+
+# Day-of-month prefix mapping — coffee-themed 2-char codes
+DAY_PREFIXES = {
+    1: 'HB',  # HeBrews
+    2: 'BW',  # Brew
+    3: 'CF',  # Coffee
+    4: 'LT',  # Latte
+    5: 'CP',  # Cappuccino
+    6: 'AM',  # Americano
+    7: 'CB',  # Cold Brew
+    8: 'DR',  # Drip
+    9: 'MT',  # Matcha
+    10: 'ES',  # Espresso
+    11: 'MK',  # Milk
+    12: 'CM',  # Cream
+    13: 'BN',  # Bean
+    14: 'RS',  # Roast
+    15: 'GR',  # Grind
+    16: 'ST',  # Steam
+    17: 'FM',  # Foam
+    18: 'BR',  # Barista
+    19: 'SH',  # Shot
+    20: 'PR',  # Pour
+    21: 'SP',  # Sip
+    22: 'CU',  # Cup
+    23: 'MG',  # Mug
+    24: 'AR',  # Aroma
+    25: 'SM',  # Smooth
+    26: 'BL',  # Blend
+    27: 'DK',  # Dark
+    28: 'JV',  # Java
+    29: 'MC',  # Mocha
+    30: 'VN',  # Vanilla
+    31: 'CR',  # Caramel
+}
+
+STALE_CODE_HOURS = 48
 
 public_bp = Blueprint('public', __name__)
 
@@ -27,7 +68,8 @@ def get_menu():
                 'id': d.id,
                 'name': d.name,
                 'description': d.description,
-                'ratio_summary': d.ratio_summary
+                'ratio_summary': d.ratio_summary,
+                'customization_types': [ct.customization_type for ct in d.customization_types]
             }
             for d in drinks
         ],
@@ -64,11 +106,68 @@ def get_slots():
     return jsonify({'slots': slots})
 
 
+# Patterns checked against the full code (prefix + suffix) with dash removed.
+# Covers common profanity and slurs including leetspeak variants (0=O, 1=I/L, 3=E, 4=A, 5=S, 7=T, 8=B).
+_PROFANITY_PATTERNS = re.compile('|'.join([
+    r'F[U\W]?[CK]{2}',
+    r'SH[1I]T',
+    r'[A4][S5]{2}',
+    r'D[1I]CK',
+    r'C[O0]CK',
+    r'CUM',
+    r'C[U\W]?NT',
+    r'P[U\W]?[S5]{2}[YI]',
+    r'T[1I]T[S5]?',
+    r'B[1I]TCH',
+    r'[S5]LUT',
+    r'WH[O0]R[E3]',
+    r'D[A4]MN',
+    r'H[E3]LL',
+    r'N[1I]G',
+    r'F[A4]G',
+    r'K[1I]K[E3]',
+    r'SP[1I]C',
+    r'W[E3]TB',
+    r'[S5]H[1I]T',
+    r'J[1I]ZZ',
+    r'[A4]NUS',
+    r'[A4]N[A4]L',
+    r'P[E3]N[1I][S5]',
+    r'V[A4]G',
+    r'D[1I]LD',
+    r'R[A4]P[E3]',
+    r'KKK',
+    r'N[A4]Z[1I]',
+    r'WTF',
+    r'STF[U\W]',
+]), re.IGNORECASE)
+
+
+def _code_is_clean(code):
+    flat = code.replace('-', '')
+    return not _PROFANITY_PATTERNS.search(flat)
+
+
 def _generate_confirmation_code():
+    prefix = DAY_PREFIXES[date.today().day]
     while True:
-        code = 'HB-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        code = f'{prefix}-{suffix}'
+        if not _code_is_clean(code):
+            continue
         if not Order.query.filter_by(confirmation_code=code).first():
             return code
+
+
+def _next_order_number(period_id):
+    # Lock existing orders in this period to prevent concurrent duplicate numbers
+    max_num = (
+        db.session.query(db.func.max(Order.order_number))
+        .filter_by(period_id=period_id)
+        .with_for_update()
+        .scalar()
+    )
+    return (max_num or 0) + 1
 
 
 @public_bp.route('/locations', methods=['GET'])
@@ -135,7 +234,9 @@ def submit_order():
         db.session.flush()
 
     code = _generate_confirmation_code()
+    order_num = _next_order_number(period.id)
     order = Order(
+        order_number=order_num,
         confirmation_code=code,
         customer_name=customer_name,
         phone_number=phone_number,
@@ -146,9 +247,17 @@ def submit_order():
     db.session.flush()
 
     for item in items:
+        drink_id = item.get('drink_id')
+        if not isinstance(drink_id, int):
+            db.session.rollback()
+            return jsonify({'error': 'Each item must have a valid drink_id.'}), 400
+        drink = Drink.query.get(drink_id)
+        if not drink or not drink.enabled:
+            db.session.rollback()
+            return jsonify({'error': f'Drink {drink_id} is not available.'}), 400
         order_item = OrderItem(
             order_id=order.id,
-            drink_id=item['drink_id'],
+            drink_id=drink_id,
             customizations=item.get('customizations', {})
         )
         db.session.add(order_item)
@@ -156,6 +265,7 @@ def submit_order():
     db.session.commit()
 
     return jsonify({
+        'order_number': order_num,
         'confirmation_code': code,
         'message': 'Order placed successfully.'
     }), 201
@@ -173,9 +283,25 @@ def get_order(confirmation_code):
     if not order:
         return jsonify({'error': 'Order not found.'}), 404
 
+    # Flag stale code lookups (>48 hours after order creation)
+    if order.created_at:
+        created = order.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+        if age_hours > STALE_CODE_HOURS:
+            logger.warning(
+                'Stale code lookup: %s (%.0fh old) from %s',
+                order.confirmation_code, age_hours,
+                request.remote_addr
+            )
+
+    # Return first name only — no phone number on public endpoint
+    first_name = order.customer_name.split()[0] if order.customer_name else ''
+
     return jsonify({
         'confirmation_code': order.confirmation_code,
-        'customer_name': order.customer_name,
+        'customer_name': first_name,
         'pickup_slot': order.pickup_slot,
         'status': order.status,
         'items': [

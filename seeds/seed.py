@@ -1,13 +1,13 @@
 """Seed the database with initial menu data from the tech spec."""
 from app import create_app, db
-from app.models import Drink, CustomizationOption, Setting, ActivePeriod
+from app.models import Drink, DrinkCustomizationType, CustomizationOption, Setting, ActivePeriod
 
 
 def seed():
     app = create_app()
     with app.app_context():
         # Clear existing data (order matters for foreign keys)
-        db.session.execute(db.text('TRUNCATE order_items, orders, active_periods, customization_options, drinks, settings, location_dates, locations RESTART IDENTITY CASCADE'))
+        db.session.execute(db.text('TRUNCATE order_items, orders, active_periods, drink_customization_types, customization_options, drinks, settings, location_dates, locations RESTART IDENTITY CASCADE'))
         db.session.commit()
 
         # Drinks
@@ -20,6 +20,21 @@ def seed():
             Drink(name='Matcha Latte', description='Matcha latte', ratio_summary='75% steamed milk, 25% ceremonial matcha — earthy and vibrant'),
         ]
         db.session.add_all(drinks)
+        db.session.flush()  # Get IDs for type assignment
+
+        # Per-drink customization type defaults
+        #                         temp  espresso  milk  syrup
+        drink_types = {
+            'Latte':          ['temperature', 'espresso_type', 'milk_type', 'syrup'],
+            'Cappuccino':     ['temperature', 'espresso_type', 'milk_type', 'syrup'],
+            'Americano':      ['temperature', 'espresso_type', 'syrup'],
+            'Cold Brew':      ['syrup'],
+            'Drip Coffee':    ['temperature', 'syrup'],
+            'Matcha Latte':   ['temperature', 'milk_type', 'syrup'],
+        }
+        for drink in drinks:
+            for ct in drink_types.get(drink.name, []):
+                db.session.add(DrinkCustomizationType(drink_id=drink.id, customization_type=ct))
 
         # Customizations
         customizations = [
