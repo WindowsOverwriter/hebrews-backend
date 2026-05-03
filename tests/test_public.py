@@ -26,8 +26,8 @@ def test_get_slots_returns_time_slots(client):
 
 def test_submit_order_success(client):
     response = client.post('/api/orders', json={
-        'customer_name': fake.name(),
-        'phone_number': fake.phone_number(),
+        'customer_name': 'Test User',
+        'phone_number': '(555) 123-4567',
         'pickup_slot': '9:00 AM',
         'items': [
             {

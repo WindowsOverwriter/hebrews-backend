@@ -64,10 +64,15 @@ def test_orders_rejected_when_disabled(client, auth_headers):
 def test_reset_period(client, auth_headers):
     response = client.post('/api/admin/period/reset', headers=auth_headers)
     assert response.status_code == 200
-    assert 'Period reset' in response.get_json()['message']
+    data = response.get_json()
+    assert 'message' in data
+    assert 'export' in data['message'].lower() or 'period' in data['message'].lower()
 
 
 def test_get_trends(client, auth_headers):
     response = client.get('/api/admin/trends', headers=auth_headers)
     assert response.status_code == 200
-    assert 'data' in response.get_json()
+    data = response.get_json()
+    assert 'drinks' in data
+    assert 'customizations' in data
+    assert 'total_orders' in data

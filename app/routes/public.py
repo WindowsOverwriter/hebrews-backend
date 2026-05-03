@@ -160,11 +160,11 @@ def _generate_confirmation_code():
 
 
 def _next_order_number(period_id):
-    # Lock existing orders in this period to prevent concurrent duplicate numbers
+    # Lock the period row to serialize order number assignment
+    db.session.query(ActivePeriod).filter_by(id=period_id).with_for_update().first()
     max_num = (
         db.session.query(db.func.max(Order.order_number))
         .filter_by(period_id=period_id)
-        .with_for_update()
         .scalar()
     )
     return (max_num or 0) + 1

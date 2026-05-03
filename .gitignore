@@ -31,3 +31,6 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Exports (anonymized session data)
+exports/

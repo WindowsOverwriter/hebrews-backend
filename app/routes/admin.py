@@ -1,6 +1,8 @@
+import json
 import os
 from functools import wraps
 from datetime import datetime, timezone, timedelta, date
+from pathlib import Path
 
 import bcrypt
 import jwt
@@ -149,19 +151,46 @@ def create_walkup_order():
 def get_trends():
     period = ActivePeriod.query.filter_by(ended_at=None).first()
     if not period:
-        return jsonify({'period_start': None, 'data': []})
+        return jsonify({'period_start': None, 'total_orders': 0, 'drinks': [], 'customizations': {}})
 
-    results = (
+    # Drink frequency
+    drink_results = (
         db.session.query(Drink.name, db.func.count())
-        .join(Order.items)
-        .join(Drink)
+        .join(OrderItem, OrderItem.drink_id == Drink.id)
+        .join(Order, Order.id == OrderItem.order_id)
         .filter(Order.period_id == period.id)
         .group_by(Drink.name)
         .all()
     )
+
+    # Customization breakdowns — parse JSONB from order items
+    order_items = (
+        db.session.query(OrderItem.customizations)
+        .join(Order, Order.id == OrderItem.order_id)
+        .filter(Order.period_id == period.id)
+        .all()
+    )
+
+    cust_counts = {}  # { type: { label: count } }
+    for (custs,) in order_items:
+        if not custs:
+            continue
+        for key in ('temperature', 'espresso_type', 'milk_type', 'syrup'):
+            val = custs.get(key)
+            if val:
+                cust_counts.setdefault(key, {})
+                cust_counts[key][val] = cust_counts[key].get(val, 0) + 1
+
+    total_orders = Order.query.filter_by(period_id=period.id).count()
+
     return jsonify({
         'period_start': period.started_at.isoformat() if period.started_at else None,
-        'data': [{'drink_name': name, 'count': count} for name, count in results]
+        'total_orders': total_orders,
+        'drinks': [{'drink_name': name, 'count': count} for name, count in drink_results],
+        'customizations': {
+            ctype: [{'label': label, 'count': count} for label, count in sorted(vals.items(), key=lambda x: -x[1])]
+            for ctype, vals in cust_counts.items()
+        }
     })
 
 
@@ -169,12 +198,102 @@ def get_trends():
 @require_auth
 def reset_period():
     current_period = ActivePeriod.query.filter_by(ended_at=None).first()
-    if current_period:
-        current_period.ended_at = datetime.now(timezone.utc)
+    if not current_period:
+        new_period = ActivePeriod()
+        db.session.add(new_period)
+        db.session.commit()
+        return jsonify({'message': 'New period started.', 'export_file': None})
+
+    # Close the current period
+    current_period.ended_at = datetime.now(timezone.utc)
+
+    # Gather orders for export before anonymizing
+    orders = (
+        Order.query
+        .filter_by(period_id=current_period.id)
+        .options(joinedload(Order.items).joinedload(OrderItem.drink))
+        .all()
+    )
+
+    # Build anonymized export data
+    export_orders = []
+    for o in orders:
+        export_orders.append({
+            'pickup_slot': o.pickup_slot,
+            'status': o.status,
+            'created_at': o.created_at.isoformat() if o.created_at else None,
+            'items': [
+                {
+                    'drink_name': item.drink.name if item.drink else 'Unknown',
+                    'customizations': item.customizations
+                }
+                for item in o.items
+            ]
+        })
+
+    # Aggregate stats for the summary
+    drink_counts = {}
+    cust_counts = {}
+    for o in orders:
+        for item in o.items:
+            dname = item.drink.name if item.drink else 'Unknown'
+            drink_counts[dname] = drink_counts.get(dname, 0) + 1
+            if item.customizations:
+                for key in ('temperature', 'espresso_type', 'milk_type', 'syrup'):
+                    val = item.customizations.get(key)
+                    if val:
+                        cust_counts.setdefault(key, {})
+                        cust_counts[key][val] = cust_counts[key].get(val, 0) + 1
+
+    export_data = {
+        'period': {
+            'id': current_period.id,
+            'started_at': current_period.started_at.isoformat() if current_period.started_at else None,
+            'ended_at': current_period.ended_at.isoformat()
+        },
+        'summary': {
+            'total_orders': len(orders),
+            'drinks': sorted(
+                [{'name': k, 'count': v} for k, v in drink_counts.items()],
+                key=lambda x: -x['count']
+            ),
+            'customizations': {
+                ctype: sorted(
+                    [{'label': k, 'count': v} for k, v in vals.items()],
+                    key=lambda x: -x['count']
+                )
+                for ctype, vals in cust_counts.items()
+            }
+        },
+        'orders': export_orders
+    }
+
+    # Write export file
+    exports_dir = Path(current_app.root_path).parent / 'exports'
+    exports_dir.mkdir(exist_ok=True)
+    date_str = current_period.ended_at.strftime('%Y-%m-%d_%H%M%S')
+    filename = f'period-{current_period.id}-{date_str}.json'
+    filepath = exports_dir / filename
+    with open(filepath, 'w') as f:
+        json.dump(export_data, f, indent=2)
+
+    # Anonymize orders in the database
+    for o in orders:
+        o.customer_name = 'Anonymous'
+        o.phone_number = ''
+        o.confirmation_code = f'ANON-{o.id}'
+        o.order_number = 0
+
+    # Start new period
     new_period = ActivePeriod()
     db.session.add(new_period)
     db.session.commit()
-    return jsonify({'message': 'Period reset. New period started.'})
+
+    return jsonify({
+        'message': 'Session ended. Data exported and anonymized.',
+        'export_file': filename,
+        'total_orders': len(orders)
+    })
 
 
 @admin_bp.route('/drinks/<int:drink_id>', methods=['PATCH'])
