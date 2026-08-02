@@ -34,3 +34,6 @@ htmlcov/
 
 # Exports (anonymized session data)
 exports/
+
+# Local DB snapshots (safety nets, not source of truth)
+backups/
