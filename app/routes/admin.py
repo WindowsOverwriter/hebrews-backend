@@ -475,17 +475,25 @@ def delete_location(location_id):
 def set_location_dates(location_id):
     """Replace all dates for a location with the provided list."""
     location = db.get_or_404(Location, location_id)
-    data = request.get_json()
-    dates = data.get('dates', [])
+    data = request.get_json() or {}
+    raw_dates = data.get('dates', [])
 
-    # Clear existing dates
+    # M8: validate every date string BEFORE mutating anything, so a bad
+    # input can't wipe the existing schedule and 500.
+    if not isinstance(raw_dates, list):
+        return jsonify({'error': 'dates must be a list of ISO date strings (YYYY-MM-DD).'}), 400
+    parsed = []
+    for d in raw_dates:
+        if not isinstance(d, str):
+            return jsonify({'error': 'Each date must be an ISO date string (YYYY-MM-DD).'}), 400
+        try:
+            parsed.append(date.fromisoformat(d))
+        except ValueError:
+            return jsonify({'error': f'Invalid date "{d}". Expected YYYY-MM-DD.'}), 400
+
     LocationDate.query.filter_by(location_id=location.id).delete()
-
-    # Add new dates
-    for d in dates:
-        loc_date = LocationDate(location_id=location.id, date=date.fromisoformat(d))
-        db.session.add(loc_date)
-
+    for parsed_date in parsed:
+        db.session.add(LocationDate(location_id=location.id, date=parsed_date))
     db.session.commit()
     return jsonify({
         'dates': sorted([d.date.isoformat() for d in location.dates])
