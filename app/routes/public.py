@@ -58,7 +58,13 @@ public_bp = Blueprint('public', __name__)
 
 @public_bp.route('/menu', methods=['GET'])
 def get_menu():
-    drinks = Drink.query.filter_by(enabled=True).all()
+    # M2: eager-load customization_types to avoid N+1 (one query per drink)
+    drinks = (
+        Drink.query
+        .filter_by(enabled=True)
+        .options(joinedload(Drink.customization_types))
+        .all()
+    )
     options = CustomizationOption.query.filter_by(enabled=True).all()
 
     customizations = {}
