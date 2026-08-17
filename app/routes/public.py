@@ -85,9 +85,9 @@ def get_menu():
 
 @public_bp.route('/slots', methods=['GET'])
 def get_slots():
-    start_setting = Setting.query.get('business_hours_start')
-    end_setting = Setting.query.get('business_hours_end')
-    interval_setting = Setting.query.get('slot_interval_minutes')
+    start_setting = db.session.get(Setting, 'business_hours_start')
+    end_setting = db.session.get(Setting, 'business_hours_end')
+    interval_setting = db.session.get(Setting, 'slot_interval_minutes')
 
     start = start_setting.value if start_setting else '08:00'
     end = end_setting.value if end_setting else '17:00'
@@ -214,7 +214,7 @@ def get_locations():
 @public_bp.route('/orders', methods=['POST'])
 @limiter.limit("10 per minute")
 def submit_order():
-    accepting = Setting.query.get('orders_accepting')
+    accepting = db.session.get(Setting, 'orders_accepting')
     if accepting and not accepting.value:
         return jsonify({'error': 'Orders are not being accepted at this time.'}), 503
 
@@ -268,7 +268,7 @@ def submit_order():
         if not isinstance(drink_id, int):
             db.session.rollback()
             return jsonify({'error': 'Each item must have a valid drink_id.'}), 400
-        drink = Drink.query.get(drink_id)
+        drink = db.session.get(Drink, drink_id)
         if not drink or not drink.enabled:
             db.session.rollback()
             return jsonify({'error': f'Drink {drink_id} is not available.'}), 400

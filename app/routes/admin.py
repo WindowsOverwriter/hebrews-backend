@@ -382,7 +382,7 @@ def update_setting():
         return jsonify({'error': 'key is required.'}), 400
     if key not in VALID_SETTING_KEYS:
         return jsonify({'error': f'Unknown setting key. Valid keys: {sorted(VALID_SETTING_KEYS)}'}), 400
-    setting = Setting.query.get(key)
+    setting = db.session.get(Setting, key)
     if not setting:
         setting = Setting(key=key, value=value)
         db.session.add(setting)
