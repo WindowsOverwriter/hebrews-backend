@@ -104,7 +104,7 @@ def get_orders():
 @admin_bp.route('/orders/<int:order_id>/status', methods=['PATCH'])
 @require_auth
 def update_order_status(order_id):
-    order = Order.query.get_or_404(order_id)
+    order = db.get_or_404(Order, order_id)
     data = request.get_json()
     status = data.get('status')
     if status not in ('queued', 'received', 'completed'):
@@ -267,7 +267,7 @@ def reset_period():
 @admin_bp.route('/drinks/<int:drink_id>', methods=['PATCH'])
 @require_auth
 def toggle_drink(drink_id):
-    drink = Drink.query.get_or_404(drink_id)
+    drink = db.get_or_404(Drink, drink_id)
     data = request.get_json()
     drink.enabled = data.get('enabled', drink.enabled)
     db.session.commit()
@@ -277,7 +277,7 @@ def toggle_drink(drink_id):
 @admin_bp.route('/customizations/<int:option_id>', methods=['PATCH'])
 @require_auth
 def toggle_customization(option_id):
-    option = CustomizationOption.query.get_or_404(option_id)
+    option = db.get_or_404(CustomizationOption, option_id)
     data = request.get_json()
     option.enabled = data.get('enabled', option.enabled)
     db.session.commit()
@@ -313,7 +313,7 @@ def create_drink():
 @admin_bp.route('/drinks/<int:drink_id>', methods=['DELETE'])
 @require_auth
 def delete_drink(drink_id):
-    drink = Drink.query.get_or_404(drink_id)
+    drink = db.get_or_404(Drink, drink_id)
     db.session.delete(drink)
     db.session.commit()
     return jsonify({'message': 'Drink deleted.'})
@@ -322,7 +322,7 @@ def delete_drink(drink_id):
 @admin_bp.route('/drinks/<int:drink_id>/customization-types', methods=['PUT'])
 @require_auth
 def set_drink_customization_types(drink_id):
-    drink = Drink.query.get_or_404(drink_id)
+    drink = db.get_or_404(Drink, drink_id)
     data = request.get_json()
     types = data.get('types', [])
     # Replace all
@@ -433,7 +433,7 @@ def create_location():
 @admin_bp.route('/locations/<int:location_id>', methods=['PATCH'])
 @require_auth
 def update_location(location_id):
-    location = Location.query.get_or_404(location_id)
+    location = db.get_or_404(Location, location_id)
     data = request.get_json()
     if 'name' in data:
         location.name = data['name'].strip()
@@ -459,7 +459,7 @@ def update_location(location_id):
 @admin_bp.route('/locations/<int:location_id>', methods=['DELETE'])
 @require_auth
 def delete_location(location_id):
-    location = Location.query.get_or_404(location_id)
+    location = db.get_or_404(Location, location_id)
     db.session.delete(location)
     db.session.commit()
     return jsonify({'message': 'Location deleted.'})
@@ -469,7 +469,7 @@ def delete_location(location_id):
 @require_auth
 def set_location_dates(location_id):
     """Replace all dates for a location with the provided list."""
-    location = Location.query.get_or_404(location_id)
+    location = db.get_or_404(Location, location_id)
     data = request.get_json()
     dates = data.get('dates', [])
 
