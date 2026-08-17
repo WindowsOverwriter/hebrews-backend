@@ -80,6 +80,11 @@ def get_menu():
             'label': opt.label
         })
 
+    # S4: surface the orders_accepting flag so the client can show a
+    # banner and block submission before hitting the 503 at /orders.
+    accepting = db.session.get(Setting, 'orders_accepting')
+    orders_accepting = bool(accepting.value) if accepting else True
+
     return jsonify({
         'drinks': [
             {
@@ -91,7 +96,8 @@ def get_menu():
             }
             for d in drinks
         ],
-        'customizations': customizations
+        'customizations': customizations,
+        'orders_accepting': orders_accepting
     })
 
 
