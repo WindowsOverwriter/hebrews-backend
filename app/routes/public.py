@@ -47,6 +47,12 @@ DAY_PREFIXES = {
 
 STALE_CODE_HOURS = 48
 
+# m15: cap the confirmation-code retry loop so a pathological state
+# (profanity-heavy RNG streak or an exhausted namespace) can't hang the
+# server thread. 10 attempts * 36^6 suffixes = astronomically unlikely
+# to hit in practice.
+_MAX_CODE_ATTEMPTS = 10
+
 # Format validation (S2): pickup_slot matches "8:30 AM" / "12:15 PM";
 # phone_number allows digits, spaces, dashes, parens, dots, and optional
 # leading + — must contain 7–15 digits total.
@@ -113,7 +119,8 @@ def get_slots():
 
     slots = []
     current = start_minutes
-    while current <= end_minutes:
+    # m16: closing time is not a valid pickup slot — use < not <=
+    while current < end_minutes:
         h, m = divmod(current, 60)
         period = 'AM' if h < 12 else 'PM'
         display_h = h if h <= 12 else h - 12
@@ -169,13 +176,16 @@ def _code_is_clean(code):
 
 def _generate_confirmation_code():
     prefix = DAY_PREFIXES[date.today().day]
-    while True:
+    for _ in range(_MAX_CODE_ATTEMPTS):
         suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         code = f'{prefix}-{suffix}'
         if not _code_is_clean(code):
             continue
         if not Order.query.filter_by(confirmation_code=code).first():
             return code
+    raise RuntimeError(
+        f'Could not generate a unique confirmation code after {_MAX_CODE_ATTEMPTS} attempts'
+    )
 
 
 def _next_order_number(period_id):
