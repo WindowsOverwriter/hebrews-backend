@@ -17,29 +17,40 @@ limiter = Limiter(
 )
 
 
+REQUIRED_ENV_VARS = ('JWT_SECRET', 'ADMIN_PASSWORD', 'FRONTEND_ORIGIN')
+
+
 def create_app(testing=False):
     app = Flask(__name__)
-
-    db_url = os.environ.get('DATABASE_URL', 'sqlite:///dev.db')
-    # psycopg (v3) requires the +psycopg dialect suffix for SQLAlchemy
-    if db_url.startswith('postgresql://'):
-        db_url = db_url.replace('postgresql://', 'postgresql+psycopg://', 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    app.config['JWT_SECRET'] = os.environ.get('JWT_SECRET', 'dev-secret-change-me')
-
-    # Hash the admin password once at startup for constant-time bcrypt comparison
-    admin_password = os.environ.get('ADMIN_PASSWORD', 'admin')
-    app.config['ADMIN_PASSWORD_HASH'] = _bcrypt.hashpw(
-        admin_password.encode('utf-8'), _bcrypt.gensalt()
-    )
 
     if testing:
         app.config['TESTING'] = True
         app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        app.config['JWT_SECRET'] = 'test-secret'
+        admin_password = 'admin'
+        frontend_origin = 'http://localhost:5173'
+    else:
+        missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+        if missing:
+            raise RuntimeError(
+                f"Refusing to start: missing required environment variable(s): "
+                f"{', '.join(missing)}. Set these in .env, docker-compose.yml, "
+                f"or your hosting platform's environment config."
+            )
 
-    frontend_origin = os.environ.get(
-        'FRONTEND_ORIGIN', 'http://localhost:5173'
+        db_url = os.environ.get('DATABASE_URL', 'sqlite:///dev.db')
+        # psycopg (v3) requires the +psycopg dialect suffix for SQLAlchemy
+        if db_url.startswith('postgresql://'):
+            db_url = db_url.replace('postgresql://', 'postgresql+psycopg://', 1)
+        app.config['SQLALCHEMY_DATABASE_URI'] = db_url
+        app.config['JWT_SECRET'] = os.environ['JWT_SECRET']
+        admin_password = os.environ['ADMIN_PASSWORD']
+        frontend_origin = os.environ['FRONTEND_ORIGIN']
+
+    # Hash the admin password once at startup for constant-time bcrypt comparison
+    app.config['ADMIN_PASSWORD_HASH'] = _bcrypt.hashpw(
+        admin_password.encode('utf-8'), _bcrypt.gensalt()
     )
     CORS(app, origins=[frontend_origin])
 
