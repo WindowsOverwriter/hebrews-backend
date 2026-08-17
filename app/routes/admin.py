@@ -14,6 +14,15 @@ from app.models import Order, OrderItem, Drink, DrinkCustomizationType, Customiz
 
 admin_bp = Blueprint('admin', __name__)
 
+# S3: only these setting keys may be created/updated via the admin API.
+# Adding a new setting requires updating both this set and any consumer.
+VALID_SETTING_KEYS = frozenset({
+    'orders_accepting',
+    'business_hours_start',
+    'business_hours_end',
+    'slot_interval_minutes',
+})
+
 
 def require_auth(f):
     @wraps(f)
@@ -371,6 +380,8 @@ def update_setting():
     value = data.get('value')
     if not key:
         return jsonify({'error': 'key is required.'}), 400
+    if key not in VALID_SETTING_KEYS:
+        return jsonify({'error': f'Unknown setting key. Valid keys: {sorted(VALID_SETTING_KEYS)}'}), 400
     setting = Setting.query.get(key)
     if not setting:
         setting = Setting(key=key, value=value)

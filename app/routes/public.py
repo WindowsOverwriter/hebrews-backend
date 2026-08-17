@@ -47,6 +47,12 @@ DAY_PREFIXES = {
 
 STALE_CODE_HOURS = 48
 
+# Format validation (S2): pickup_slot matches "8:30 AM" / "12:15 PM";
+# phone_number allows digits, spaces, dashes, parens, dots, and optional
+# leading + — must contain 7–15 digits total.
+_PICKUP_SLOT_RE = re.compile(r'^(1[0-2]|[1-9]):[0-5]\d\s(AM|PM)$')
+_PHONE_ALLOWED_RE = re.compile(r'^[\d\s\-().+]{7,20}$')
+
 public_bp = Blueprint('public', __name__)
 
 
@@ -85,7 +91,14 @@ def get_slots():
 
     start = start_setting.value if start_setting else '08:00'
     end = end_setting.value if end_setting else '17:00'
-    interval = interval_setting.value if interval_setting else 15
+    # M7: settings values are JSON — coerce to int; fall back to 15 if the
+    # stored value can't be parsed (avoids an infinite loop below).
+    try:
+        interval = int(interval_setting.value) if interval_setting else 15
+    except (TypeError, ValueError):
+        interval = 15
+    if interval <= 0:
+        interval = 15
 
     start_h, start_m = map(int, start.split(':'))
     end_h, end_m = map(int, end.split(':'))
@@ -222,6 +235,10 @@ def submit_order():
         return jsonify({'error': 'phone_number must be 20 characters or fewer.'}), 400
     if len(pickup_slot) > 20:
         return jsonify({'error': 'pickup_slot must be 20 characters or fewer.'}), 400
+    if not _PICKUP_SLOT_RE.match(pickup_slot):
+        return jsonify({'error': 'pickup_slot must look like "8:30 AM" or "12:15 PM".'}), 400
+    if not _PHONE_ALLOWED_RE.match(phone_number) or sum(c.isdigit() for c in phone_number) < 7:
+        return jsonify({'error': 'phone_number must contain 7–15 digits with only digits, spaces, dashes, parens, dots, or a leading +.'}), 400
     if not items:
         return jsonify({'error': 'At least one item is required.'}), 400
     if len(items) > 20:
