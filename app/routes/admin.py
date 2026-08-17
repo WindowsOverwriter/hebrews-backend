@@ -11,7 +11,6 @@ from flask import Blueprint, jsonify, request, current_app
 from sqlalchemy.orm import joinedload
 from app import db, limiter
 from app.models import Order, OrderItem, Drink, DrinkCustomizationType, CustomizationOption, Setting, ActivePeriod, Location, LocationDate
-from app.routes.public import _generate_confirmation_code, _next_order_number
 
 admin_bp = Blueprint('admin', __name__)
 
@@ -104,46 +103,6 @@ def update_order_status(order_id):
     order.status = status
     db.session.commit()
     return jsonify({'status': order.status})
-
-
-@admin_bp.route('/orders/walkup', methods=['POST'])
-@require_auth
-def create_walkup_order():
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Request body is required.'}), 400
-
-    customer_name = (data.get('customer_name') or '').strip()
-    phone_number = (data.get('phone_number') or '').strip()
-
-    if not customer_name or not phone_number:
-        return jsonify({'error': 'customer_name and phone_number are required.'}), 400
-
-    period = ActivePeriod.query.filter_by(ended_at=None).first()
-    if not period:
-        period = ActivePeriod()
-        db.session.add(period)
-        db.session.flush()
-
-    code = _generate_confirmation_code()
-    order_num = _next_order_number(period.id)
-    order = Order(
-        order_number=order_num,
-        confirmation_code=code,
-        customer_name=customer_name,
-        phone_number=phone_number,
-        pickup_slot='Walk-up',
-        status='received',
-        period_id=period.id
-    )
-    db.session.add(order)
-    db.session.commit()
-
-    return jsonify({
-        'order_number': order_num,
-        'confirmation_code': code,
-        'message': 'Walk-up order created.'
-    }), 201
 
 
 @admin_bp.route('/trends', methods=['GET'])
