@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request, current_app
 from sqlalchemy.orm import joinedload
 from app import db, limiter
 from app.models import Order, OrderItem, Drink, DrinkCustomizationType, CustomizationOption, Setting, ActivePeriod, Location, LocationDate
+from app.routes.public import purge_expired_locations
 
 admin_bp = Blueprint('admin', __name__)
 
@@ -395,6 +396,10 @@ def update_setting():
 @admin_bp.route('/locations', methods=['GET'])
 @require_auth
 def get_all_locations():
+    # M5: admin dashboard visit is the natural cleanup moment for expired
+    # locations. Auth-gated + admins expect the list to be authoritative.
+    if purge_expired_locations():
+        db.session.commit()
     locations = Location.query.order_by(Location.name).all()
     return jsonify({
         'locations': [

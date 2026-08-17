@@ -189,17 +189,34 @@ def _next_order_number(period_id):
     return (max_num or 0) + 1
 
 
-@public_bp.route('/locations', methods=['GET'])
-def get_locations():
+def purge_expired_locations():
+    """Delete locations whose delete_after date has passed. Callers own the
+    commit — this only stages deletes on the session."""
     today = date.today()
-    # Auto-delete expired locations
-    expired = Location.query.filter(Location.delete_after != None, Location.delete_after <= today).all()
+    expired = Location.query.filter(
+        Location.delete_after != None,
+        Location.delete_after <= today
+    ).all()
     for loc in expired:
         db.session.delete(loc)
-    if expired:
-        db.session.commit()
+    return len(expired)
 
-    locations = Location.query.filter_by(active=True).order_by(Location.name).all()
+
+@public_bp.route('/locations', methods=['GET'])
+def get_locations():
+    # M5: GET stays idempotent — filter expired out in the query rather than
+    # deleting them here. Actual cleanup runs when admin views their list
+    # (see admin.get_all_locations).
+    today = date.today()
+    locations = (
+        Location.query
+        .filter_by(active=True)
+        .filter(
+            (Location.delete_after == None) | (Location.delete_after > today)
+        )
+        .order_by(Location.name)
+        .all()
+    )
     return jsonify({
         'locations': [
             {
