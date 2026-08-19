@@ -1,0 +1,34 @@
+# Render Blueprint for hebrews-backend.
+#
+# Apply: Render dashboard → Blueprints → New Blueprint Instance → connect this repo.
+# Update: dashboard → Blueprints → your instance → Sync (after any change here).
+#
+# Deploys are triggered exclusively by .github/workflows/deploy.yml firing the
+# Render deploy hook after CI passes; `autoDeployTrigger: off` blocks Render
+# from also deploying on every commit. To switch to Render-managed gating,
+# set `autoDeployTrigger: checksPass` and remove the deploy workflow.
+
+services:
+  - type: web
+    name: hebrews-backend
+    runtime: python
+    # `starter` = $7/mo, always-on. Alternatives: `free` (spins down after ~15min idle),
+    # `standard` / `pro` / `pro plus` for higher tiers.
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn wsgi:application
+    autoDeployTrigger: off
+    # Public GET that returns 200 and exercises the DB — validates full stack on deploy.
+    healthCheckPath: /api/menu
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: FRONTEND_ORIGIN
+        value: https://windowsoverwriter.github.io
+      # Neon Postgres connection string — pasted at Blueprint creation.
+      - key: DATABASE_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: '3.13'
