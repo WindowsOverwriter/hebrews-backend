@@ -12,9 +12,9 @@ services:
   - type: web
     name: hebrews-backend
     runtime: python
-    # `starter` = $7/mo, always-on. Alternatives: `free` (spins down after ~15min idle),
-    # `standard` / `pro` / `pro plus` for higher tiers.
-    plan: starter
+    # `free` spins down after ~15min idle (30-60s cold start on next request).
+    # Bump to `starter` ($7/mo, always-on) before real customer traffic.
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn wsgi:application
     autoDeployTrigger: off
