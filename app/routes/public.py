@@ -71,7 +71,7 @@ def get_menu():
         .options(joinedload(Drink.customization_types))
         .all()
     )
-    options = CustomizationOption.query.filter_by(enabled=True).all()
+    options = CustomizationOption.query.filter_by(enabled=True).order_by(CustomizationOption.id).all()
 
     customizations = {}
     for opt in options:

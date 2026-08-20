@@ -24,6 +24,17 @@ VALID_SETTING_KEYS = frozenset({
     'slot_interval_minutes',
 })
 
+# Constrain customization option types to the four the trends aggregator
+# (get_trends) and drink-type assignment know about. Adding a new type requires
+# code changes elsewhere, not just an admin-UI action.
+VALID_CUSTOMIZATION_TYPES = frozenset({
+    'temperature',
+    'espresso_type',
+    'milk_type',
+    'syrup',
+})
+MAX_CUSTOMIZATION_LABEL_LEN = 100
+
 
 def require_auth(f):
     @wraps(f)
@@ -277,12 +288,67 @@ def toggle_drink(drink_id):
 
 @admin_bp.route('/customizations/<int:option_id>', methods=['PATCH'])
 @require_auth
-def toggle_customization(option_id):
+def update_customization(option_id):
     option = db.get_or_404(CustomizationOption, option_id)
-    data = request.get_json()
-    option.enabled = data.get('enabled', option.enabled)
+    data = request.get_json() or {}
+    if 'label' in data:
+        label = (data.get('label') or '').strip()
+        if not label:
+            return jsonify({'error': 'label must be a non-empty string.'}), 400
+        if len(label) > MAX_CUSTOMIZATION_LABEL_LEN:
+            return jsonify({'error': f'label must be {MAX_CUSTOMIZATION_LABEL_LEN} characters or fewer.'}), 400
+        duplicate = CustomizationOption.query.filter(
+            CustomizationOption.type == option.type,
+            CustomizationOption.label == label,
+            CustomizationOption.id != option.id,
+        ).first()
+        if duplicate:
+            return jsonify({'error': f'A {option.type} option named "{label}" already exists.'}), 400
+        option.label = label
+    if 'enabled' in data:
+        option.enabled = data['enabled']
     db.session.commit()
-    return jsonify({'id': option.id, 'enabled': option.enabled})
+    return jsonify({
+        'id': option.id,
+        'type': option.type,
+        'label': option.label,
+        'enabled': option.enabled,
+    })
+
+
+@admin_bp.route('/customizations', methods=['POST'])
+@require_auth
+def create_customization():
+    data = request.get_json() or {}
+    type_ = (data.get('type') or '').strip()
+    label = (data.get('label') or '').strip()
+    if type_ not in VALID_CUSTOMIZATION_TYPES:
+        return jsonify({'error': f'Unknown type. Valid types: {sorted(VALID_CUSTOMIZATION_TYPES)}'}), 400
+    if not label:
+        return jsonify({'error': 'label must be a non-empty string.'}), 400
+    if len(label) > MAX_CUSTOMIZATION_LABEL_LEN:
+        return jsonify({'error': f'label must be {MAX_CUSTOMIZATION_LABEL_LEN} characters or fewer.'}), 400
+    duplicate = CustomizationOption.query.filter_by(type=type_, label=label).first()
+    if duplicate:
+        return jsonify({'error': f'A {type_} option named "{label}" already exists.'}), 400
+    option = CustomizationOption(type=type_, label=label)
+    db.session.add(option)
+    db.session.commit()
+    return jsonify({
+        'id': option.id,
+        'type': option.type,
+        'label': option.label,
+        'enabled': option.enabled,
+    }), 201
+
+
+@admin_bp.route('/customizations/<int:option_id>', methods=['DELETE'])
+@require_auth
+def delete_customization(option_id):
+    option = db.get_or_404(CustomizationOption, option_id)
+    db.session.delete(option)
+    db.session.commit()
+    return jsonify({'message': 'Customization option deleted.'})
 
 
 @admin_bp.route('/drinks', methods=['POST'])
@@ -340,7 +406,7 @@ def set_drink_customization_types(drink_id):
 @require_auth
 def get_admin_menu():
     drinks = Drink.query.order_by(Drink.name).all()
-    options = CustomizationOption.query.order_by(CustomizationOption.type, CustomizationOption.label).all()
+    options = CustomizationOption.query.order_by(CustomizationOption.type, CustomizationOption.id).all()
 
     customizations = {}
     for opt in options:
