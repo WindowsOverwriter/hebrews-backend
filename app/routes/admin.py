@@ -10,7 +10,7 @@ from flask import Blueprint, jsonify, request, current_app
 
 from sqlalchemy.orm import joinedload
 from app import db, limiter
-from app.models import Order, OrderItem, Drink, DrinkCustomizationType, CustomizationOption, Setting, ActivePeriod, Location, LocationDate
+from app.models import Order, OrderItem, Drink, DrinkCustomizationType, CustomizationOption, DrinkCustomizationOption, Setting, ActivePeriod, Location, LocationDate
 from app.routes.public import purge_expired_locations
 
 admin_bp = Blueprint('admin', __name__)
@@ -346,6 +346,8 @@ def create_customization():
 @require_auth
 def delete_customization(option_id):
     option = db.get_or_404(CustomizationOption, option_id)
+    # Cascade at the app level so SQLite (no PRAGMA foreign_keys) also cleans up.
+    DrinkCustomizationOption.query.filter_by(customization_option_id=option_id).delete()
     db.session.delete(option)
     db.session.commit()
     return jsonify({'message': 'Customization option deleted.'})
@@ -402,11 +404,99 @@ def set_drink_customization_types(drink_id):
     })
 
 
+@admin_bp.route('/drinks/<int:drink_id>/customization-options', methods=['PUT'])
+@require_auth
+def set_drink_customization_options(drink_id):
+    """Replace this drink's per-type option allowlist. Body:
+        {"overrides": {"temperature": [2], "milk_type": [7, 8]}}
+    Types omitted or given an empty list clear their override
+    (drink falls back to all globally-enabled options of that type)."""
+    drink = db.get_or_404(Drink, drink_id)
+    data = request.get_json() or {}
+    overrides = data.get('overrides', {})
+
+    if not isinstance(overrides, dict):
+        return jsonify({'error': 'overrides must be an object mapping type -> list of option IDs.'}), 400
+
+    validated = {}  # type -> list of ids
+    for type_, ids in overrides.items():
+        if type_ not in VALID_CUSTOMIZATION_TYPES:
+            return jsonify({'error': f'Unknown type "{type_}".'}), 400
+        if not isinstance(ids, list):
+            return jsonify({'error': f'overrides["{type_}"] must be a list of option IDs.'}), 400
+        for opt_id in ids:
+            if not isinstance(opt_id, int):
+                return jsonify({'error': f'overrides["{type_}"] must contain integer IDs.'}), 400
+        if not ids:
+            continue  # Empty list = clear override for this type
+        valid_ids = {
+            o.id for o in CustomizationOption.query.filter(
+                CustomizationOption.type == type_,
+                CustomizationOption.id.in_(ids),
+            ).all()
+        }
+        invalid = set(ids) - valid_ids
+        if invalid:
+            return jsonify({'error': f'Invalid option IDs for type "{type_}": {sorted(invalid)}.'}), 400
+        validated[type_] = list(dict.fromkeys(ids))  # de-dup, preserve order
+
+    DrinkCustomizationOption.query.filter_by(drink_id=drink.id).delete()
+    for type_, ids in validated.items():
+        for opt_id in ids:
+            db.session.add(DrinkCustomizationOption(
+                drink_id=drink.id,
+                customization_option_id=opt_id,
+            ))
+    db.session.commit()
+
+    return jsonify({'allowed_customization_options': _drink_override_map(drink.id)})
+
+
+def _drink_override_map(drink_id):
+    """Return {type: [option_ids]} for this drink; empty dict if no overrides."""
+    rows = (
+        db.session.query(CustomizationOption.type, CustomizationOption.id)
+        .join(
+            DrinkCustomizationOption,
+            DrinkCustomizationOption.customization_option_id == CustomizationOption.id,
+        )
+        .filter(DrinkCustomizationOption.drink_id == drink_id)
+        .order_by(CustomizationOption.type, CustomizationOption.id)
+        .all()
+    )
+    result = {}
+    for type_, opt_id in rows:
+        result.setdefault(type_, []).append(opt_id)
+    return result
+
+
+def build_all_override_maps():
+    """Build {drink_id: {type: [option_ids]}} for every drink with overrides."""
+    rows = (
+        db.session.query(
+            DrinkCustomizationOption.drink_id,
+            CustomizationOption.type,
+            DrinkCustomizationOption.customization_option_id,
+        )
+        .join(
+            CustomizationOption,
+            CustomizationOption.id == DrinkCustomizationOption.customization_option_id,
+        )
+        .order_by(CustomizationOption.type, CustomizationOption.id)
+        .all()
+    )
+    result = {}
+    for drink_id, type_, opt_id in rows:
+        result.setdefault(drink_id, {}).setdefault(type_, []).append(opt_id)
+    return result
+
+
 @admin_bp.route('/menu', methods=['GET'])
 @require_auth
 def get_admin_menu():
     drinks = Drink.query.order_by(Drink.name).all()
     options = CustomizationOption.query.order_by(CustomizationOption.type, CustomizationOption.id).all()
+    override_maps = build_all_override_maps()
 
     customizations = {}
     for opt in options:
@@ -416,19 +506,22 @@ def get_admin_menu():
             'enabled': opt.enabled
         })
 
+    def _drink_dict(d):
+        result = {
+            'id': d.id,
+            'name': d.name,
+            'description': d.description,
+            'ratio_summary': d.ratio_summary,
+            'enabled': d.enabled,
+            'customization_types': [ct.customization_type for ct in d.customization_types],
+        }
+        if d.id in override_maps:
+            result['allowed_customization_options'] = override_maps[d.id]
+        return result
+
     return jsonify({
-        'drinks': [
-            {
-                'id': d.id,
-                'name': d.name,
-                'description': d.description,
-                'ratio_summary': d.ratio_summary,
-                'enabled': d.enabled,
-                'customization_types': [ct.customization_type for ct in d.customization_types]
-            }
-            for d in drinks
-        ],
-        'customizations': customizations
+        'drinks': [_drink_dict(d) for d in drinks],
+        'customizations': customizations,
     })
 
 

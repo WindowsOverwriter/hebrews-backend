@@ -23,6 +23,7 @@ class Drink(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     customization_types = db.relationship('DrinkCustomizationType', backref='drink', lazy=True, cascade='all, delete-orphan')
+    option_overrides = db.relationship('DrinkCustomizationOption', backref='drink', lazy=True, cascade='all, delete-orphan')
 
 
 class DrinkCustomizationType(db.Model):
@@ -44,6 +45,24 @@ class CustomizationOption(db.Model):
     type = db.Column(db.String(50), nullable=False)
     label = db.Column(db.String(100), nullable=False)
     enabled = db.Column(db.Boolean, default=True)
+
+
+class DrinkCustomizationOption(db.Model):
+    """Per-drink allowlist override: if any rows exist for (drink, type),
+    only the listed options apply to that drink. Absence of rows means
+    all globally-enabled options of that type apply (default behavior)."""
+
+    __tablename__ = 'drink_customization_options'
+
+    id = db.Column(db.Integer, primary_key=True)
+    drink_id = db.Column(db.Integer, db.ForeignKey('drinks.id'), nullable=False)
+    customization_option_id = db.Column(
+        db.Integer, db.ForeignKey('customization_options.id'), nullable=False
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint('drink_id', 'customization_option_id', name='uq_drink_option'),
+    )
 
 
 class Order(db.Model):

@@ -180,6 +180,120 @@ def test_delete_customization_requires_auth(client):
     assert response.status_code == 401
 
 
+def test_drink_deletion_cascades_options_overrides(client, auth_headers):
+    # Seed an override, then delete the drink; overrides must not leak.
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2]},
+    }, headers=auth_headers)
+    client.delete('/api/admin/drinks/1', headers=auth_headers)
+    # Fetching admin menu shouldn't crash or return the deleted drink's overrides.
+    resp = client.get('/api/admin/menu', headers=auth_headers)
+    assert resp.status_code == 200
+    for d in resp.get_json()['drinks']:
+        assert d['id'] != 1
+
+
+def test_delete_customization_cascades_overrides(client, auth_headers):
+    # Set override that references option id=4 (Vanilla), then delete Vanilla;
+    # the override rows for it must be cleaned up.
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'syrup': [4]},
+    }, headers=auth_headers)
+    resp = client.delete('/api/admin/customizations/4', headers=auth_headers)
+    assert resp.status_code == 200
+    # Menu should now show drink 1 with no syrup override remaining.
+    menu = client.get('/api/menu').get_json()
+    drink1 = next(d for d in menu['drinks'] if d['id'] == 1)
+    assert 'allowed_customization_options' not in drink1 or 'syrup' not in drink1.get('allowed_customization_options', {})
+
+
+# ─── Per-drink option overrides ───
+
+def test_set_drink_options_override_stores_and_returns(client, auth_headers):
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2]},  # 2 = Iced
+    }, headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.get_json()['allowed_customization_options'] == {'temperature': [2]}
+
+
+def test_public_menu_includes_override(client, auth_headers):
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2]},
+    }, headers=auth_headers)
+    menu = client.get('/api/menu').get_json()
+    drink1 = next(d for d in menu['drinks'] if d['id'] == 1)
+    assert drink1['allowed_customization_options'] == {'temperature': [2]}
+
+
+def test_public_menu_omits_override_key_when_none(client):
+    menu = client.get('/api/menu').get_json()
+    for d in menu['drinks']:
+        # No overrides seeded → key must be absent (not present-and-empty).
+        assert 'allowed_customization_options' not in d
+
+
+def test_empty_list_clears_override(client, auth_headers):
+    # Set then clear
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2]},
+    }, headers=auth_headers)
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': []},
+    }, headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.get_json()['allowed_customization_options'] == {}
+
+
+def test_omitting_type_clears_override(client, auth_headers):
+    # Set for temperature and syrup, then re-PUT with only syrup — temperature must clear.
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2], 'syrup': [4]},
+    }, headers=auth_headers)
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'syrup': [4]},
+    }, headers=auth_headers)
+    body = resp.get_json()
+    assert 'temperature' not in body['allowed_customization_options']
+    assert body['allowed_customization_options']['syrup'] == [4]
+
+
+def test_override_rejects_unknown_type(client, auth_headers):
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'sweetener': [1]},
+    }, headers=auth_headers)
+    assert resp.status_code == 400
+
+
+def test_override_rejects_cross_type_id(client, auth_headers):
+    # id=4 is Vanilla (syrup), not a temperature option.
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [4]},
+    }, headers=auth_headers)
+    assert resp.status_code == 400
+
+
+def test_override_rejects_nonexistent_id(client, auth_headers):
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [9999]},
+    }, headers=auth_headers)
+    assert resp.status_code == 400
+
+
+def test_override_rejects_non_integer_id(client, auth_headers):
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': ['2']},
+    }, headers=auth_headers)
+    assert resp.status_code == 400
+
+
+def test_override_requires_auth(client):
+    resp = client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2]},
+    })
+    assert resp.status_code == 401
+
+
 def test_admin_menu_customizations_sorted_by_creation(client, auth_headers):
     # Seeded syrup: Vanilla (id=4). Add two more; verify creation order,
     # not alphabetical (Almond would come first if sorted by label).

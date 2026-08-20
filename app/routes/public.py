@@ -4,7 +4,7 @@ import re
 from flask import Blueprint, jsonify, request
 from sqlalchemy.orm import joinedload
 from app import db, limiter
-from app.models import Drink, DrinkCustomizationType, CustomizationOption, Order, OrderItem, Setting, ActivePeriod, Location, LocationDate
+from app.models import Drink, DrinkCustomizationType, CustomizationOption, DrinkCustomizationOption, Order, OrderItem, Setting, ActivePeriod, Location, LocationDate
 import random
 import string
 
@@ -80,24 +80,46 @@ def get_menu():
             'label': opt.label
         })
 
+    # Per-drink option allowlists — when present for (drink, type), the client
+    # filters the global customizations map to only these ids.
+    override_rows = (
+        db.session.query(
+            DrinkCustomizationOption.drink_id,
+            CustomizationOption.type,
+            DrinkCustomizationOption.customization_option_id,
+        )
+        .join(
+            CustomizationOption,
+            CustomizationOption.id == DrinkCustomizationOption.customization_option_id,
+        )
+        .order_by(CustomizationOption.type, CustomizationOption.id)
+        .all()
+    )
+    override_maps = {}
+    for drink_id, type_, opt_id in override_rows:
+        override_maps.setdefault(drink_id, {}).setdefault(type_, []).append(opt_id)
+
     # S4: surface the orders_accepting flag so the client can show a
     # banner and block submission before hitting the 503 at /orders.
     accepting = db.session.get(Setting, 'orders_accepting')
     orders_accepting = bool(accepting.value) if accepting else True
 
+    def _drink_dict(d):
+        result = {
+            'id': d.id,
+            'name': d.name,
+            'description': d.description,
+            'ratio_summary': d.ratio_summary,
+            'customization_types': [ct.customization_type for ct in d.customization_types],
+        }
+        if d.id in override_maps:
+            result['allowed_customization_options'] = override_maps[d.id]
+        return result
+
     return jsonify({
-        'drinks': [
-            {
-                'id': d.id,
-                'name': d.name,
-                'description': d.description,
-                'ratio_summary': d.ratio_summary,
-                'customization_types': [ct.customization_type for ct in d.customization_types]
-            }
-            for d in drinks
-        ],
+        'drinks': [_drink_dict(d) for d in drinks],
         'customizations': customizations,
-        'orders_accepting': orders_accepting
+        'orders_accepting': orders_accepting,
     })
 
 
