@@ -1,7 +1,9 @@
 from datetime import date, datetime, timezone
 import logging
 import re
-from flask import Blueprint, jsonify, request
+from zoneinfo import ZoneInfo
+from flask import Blueprint, jsonify, request, current_app
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload
 from app import db, limiter
 from app.models import Drink, DrinkCustomizationType, CustomizationOption, DrinkCustomizationOption, Order, OrderItem, Setting, ActivePeriod, Location, LocationDate
@@ -56,10 +58,52 @@ _MAX_CODE_ATTEMPTS = 10
 # Format validation (S2): pickup_slot matches "8:30 AM" / "12:15 PM";
 # phone_number allows digits, spaces, dashes, parens, dots, and optional
 # leading + — must contain 7–15 digits total.
-_PICKUP_SLOT_RE = re.compile(r'^(1[0-2]|[1-9]):[0-5]\d\s(AM|PM)$')
+PICKUP_SLOT_RE = re.compile(r'^(1[0-2]|[1-9]):([0-5]\d)\s(AM|PM)$')
+# 24-hour 'HH:MM' as stored in the business_hours_* settings.
+HHMM_RE = re.compile(r'^([01]?\d|2[0-3]):([0-5]\d)$')
 _PHONE_ALLOWED_RE = re.compile(r'^[\d\s\-().+]{7,20}$')
 
+# customizations must be a flat JSON object of scalar values. The admin
+# trends/reset aggregators call .get() on it and use values as dict keys, so
+# a list, string, or nested object here would 500 the admin dashboard for
+# the rest of the period. Keys are not whitelisted (see pending F1) -- only
+# shape and size are enforced.
+_MAX_CUSTOMIZATION_KEYS = 20
+_MAX_CUSTOMIZATION_KEY_LEN = 50
+_MAX_CUSTOMIZATION_VALUE_LEN = 500
+
+# A15: attempts at inserting one order before giving up on unique-constraint
+# collisions (confirmation code, or order number on SQLite where the
+# period row lock is a no-op).
+_MAX_ORDER_ATTEMPTS = 3
+
 public_bp = Blueprint('public', __name__)
+
+
+def business_today():
+    """Calendar date in the business's timezone (BUSINESS_TIMEZONE), not the
+    server's. Use this for anything that means 'today' to a customer."""
+    return datetime.now(ZoneInfo(current_app.config['BUSINESS_TIMEZONE'])).date()
+
+
+def get_current_period():
+    """The open ordering period. If a race ever leaves two open, the newest
+    wins deterministically (A12); reset_period closes all of them."""
+    return (
+        ActivePeriod.query
+        .filter_by(ended_at=None)
+        .order_by(ActivePeriod.id.desc())
+        .first()
+    )
+
+
+def _parse_hhmm(value, default):
+    """'HH:MM' -> minutes since midnight, or `default` if unparseable."""
+    if isinstance(value, str):
+        m = HHMM_RE.match(value.strip())
+        if m:
+            return int(m.group(1)) * 60 + int(m.group(2))
+    return default
 
 
 @public_bp.route('/menu', methods=['GET'])
@@ -129,8 +173,11 @@ def get_slots():
     end_setting = db.session.get(Setting, 'business_hours_end')
     interval_setting = db.session.get(Setting, 'slot_interval_minutes')
 
-    start = start_setting.value if start_setting else '08:00'
-    end = end_setting.value if end_setting else '17:00'
+    # A6: admin PATCH now validates these, but rows written before that (or
+    # by hand in the DB) may still hold garbage. Fall back to the defaults
+    # rather than 500 the whole order flow.
+    start_minutes = _parse_hhmm(start_setting.value if start_setting else None, 8 * 60)
+    end_minutes = _parse_hhmm(end_setting.value if end_setting else None, 17 * 60)
     # M7: settings values are JSON — coerce to int; fall back to 15 if the
     # stored value can't be parsed (avoids an infinite loop below).
     try:
@@ -139,11 +186,6 @@ def get_slots():
         interval = 15
     if interval <= 0:
         interval = 15
-
-    start_h, start_m = map(int, start.split(':'))
-    end_h, end_m = map(int, end.split(':'))
-    start_minutes = start_h * 60 + start_m
-    end_minutes = end_h * 60 + end_m
 
     slots = []
     current = start_minutes
@@ -203,7 +245,7 @@ def _code_is_clean(code):
 
 
 def _generate_confirmation_code():
-    prefix = DAY_PREFIXES[date.today().day]
+    prefix = DAY_PREFIXES[business_today().day]
     for _ in range(_MAX_CODE_ATTEMPTS):
         suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
         code = f'{prefix}-{suffix}'
@@ -214,6 +256,25 @@ def _generate_confirmation_code():
     raise RuntimeError(
         f'Could not generate a unique confirmation code after {_MAX_CODE_ATTEMPTS} attempts'
     )
+
+
+def _validate_customizations(value):
+    """Return (cleaned_dict, None) or (None, error_message)."""
+    if value is None:
+        return {}, None
+    if not isinstance(value, dict):
+        return None, 'customizations must be an object.'
+    if len(value) > _MAX_CUSTOMIZATION_KEYS:
+        return None, f'customizations may have at most {_MAX_CUSTOMIZATION_KEYS} keys.'
+    for key, val in value.items():
+        if not isinstance(key, str) or not key or len(key) > _MAX_CUSTOMIZATION_KEY_LEN:
+            return None, f'customization keys must be non-empty strings of {_MAX_CUSTOMIZATION_KEY_LEN} characters or fewer.'
+        if isinstance(val, str):
+            if len(val) > _MAX_CUSTOMIZATION_VALUE_LEN:
+                return None, f'customization "{key}" must be {_MAX_CUSTOMIZATION_VALUE_LEN} characters or fewer.'
+        elif val is not None and not isinstance(val, (bool, int, float)):
+            return None, f'customization "{key}" must be a string, number, boolean, or null.'
+    return value, None
 
 
 def _next_order_number(period_id):
@@ -229,11 +290,14 @@ def _next_order_number(period_id):
 
 def purge_expired_locations():
     """Delete locations whose delete_after date has passed. Callers own the
-    commit — this only stages deletes on the session."""
-    today = date.today()
+    commit — this only stages deletes on the session.
+
+    delete_after is the LAST day the location is shown (A9): a location is
+    purged strictly after that date, in business-local time."""
+    today = business_today()
     expired = Location.query.filter(
         Location.delete_after != None,
-        Location.delete_after <= today
+        Location.delete_after < today
     ).all()
     for loc in expired:
         db.session.delete(loc)
@@ -245,12 +309,12 @@ def get_locations():
     # M5: GET stays idempotent — filter expired out in the query rather than
     # deleting them here. Actual cleanup runs when admin views their list
     # (see admin.get_all_locations).
-    today = date.today()
+    today = business_today()
     locations = (
         Location.query
         .filter_by(active=True)
         .filter(
-            (Location.delete_after == None) | (Location.delete_after > today)
+            (Location.delete_after == None) | (Location.delete_after >= today)
         )
         .order_by(Location.name)
         .all()
@@ -279,14 +343,21 @@ def submit_order():
     if accepting and not accepting.value:
         return jsonify({'error': 'Orders are not being accepted at this time.'}), 503
 
-    data = request.get_json()
-    if not data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
         return jsonify({'error': 'Request body is required.'}), 400
 
-    customer_name = data.get('customer_name', '').strip()
-    phone_number = data.get('phone_number', '').strip()
-    pickup_slot = data.get('pickup_slot', '').strip()
-    items = data.get('items', [])
+    # A7: a null or non-string field is a client error, not a 500 from .strip().
+    for field in ('customer_name', 'phone_number', 'pickup_slot'):
+        value = data.get(field)
+        if value is not None and not isinstance(value, str):
+            return jsonify({'error': f'{field} must be a string.'}), 400
+    customer_name = (data.get('customer_name') or '').strip()
+    phone_number = (data.get('phone_number') or '').strip()
+    pickup_slot = (data.get('pickup_slot') or '').strip()
+    items = data.get('items')
+    if items is None:
+        items = []
 
     if not customer_name or not phone_number or not pickup_slot:
         return jsonify({'error': 'customer_name, phone_number, and pickup_slot are required.'}), 400
@@ -296,16 +367,61 @@ def submit_order():
         return jsonify({'error': 'phone_number must be 20 characters or fewer.'}), 400
     if len(pickup_slot) > 20:
         return jsonify({'error': 'pickup_slot must be 20 characters or fewer.'}), 400
-    if not _PICKUP_SLOT_RE.match(pickup_slot):
+    if not PICKUP_SLOT_RE.match(pickup_slot):
         return jsonify({'error': 'pickup_slot must look like "8:30 AM" or "12:15 PM".'}), 400
     if not _PHONE_ALLOWED_RE.match(phone_number) or sum(c.isdigit() for c in phone_number) < 7:
         return jsonify({'error': 'phone_number must contain 7–15 digits with only digits, spaces, dashes, parens, dots, or a leading +.'}), 400
+    if not isinstance(items, list):
+        return jsonify({'error': 'items must be a list.'}), 400
     if not items:
         return jsonify({'error': 'At least one item is required.'}), 400
     if len(items) > 20:
         return jsonify({'error': 'Maximum 20 items per order.'}), 400
 
-    period = ActivePeriod.query.filter_by(ended_at=None).first()
+    # Validate every item before writing anything, so the insert below is a
+    # short transaction that can be retried wholesale.
+    validated_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            return jsonify({'error': 'Each item must be an object.'}), 400
+        drink_id = item.get('drink_id')
+        if not isinstance(drink_id, int) or isinstance(drink_id, bool):
+            return jsonify({'error': 'Each item must have a valid drink_id.'}), 400
+        drink = db.session.get(Drink, drink_id)
+        if not drink or not drink.enabled:
+            return jsonify({'error': f'Drink {drink_id} is not available.'}), 400
+        customizations, cust_error = _validate_customizations(item.get('customizations'))
+        if cust_error:
+            return jsonify({'error': cust_error}), 400
+        validated_items.append((drink_id, customizations))
+
+    # A15: the confirmation code is checked-then-inserted, and on SQLite the
+    # period row lock is a no-op, so two simultaneous orders can still collide
+    # on a unique constraint. Retry with a fresh code/number instead of 500ing.
+    order = None
+    for attempt in range(_MAX_ORDER_ATTEMPTS):
+        try:
+            order = _create_order(customer_name, phone_number, pickup_slot, validated_items)
+            db.session.commit()
+            break
+        except IntegrityError:
+            db.session.rollback()
+            order = None
+            logger.warning('Order insert collided on a unique constraint (attempt %d)', attempt + 1)
+    if order is None:
+        return jsonify({'error': 'Could not place your order right now. Please try again.'}), 503
+
+    return jsonify({
+        'order_number': order.order_number,
+        'confirmation_code': order.confirmation_code,
+        'message': 'Order placed successfully.'
+    }), 201
+
+
+def _create_order(customer_name, phone_number, pickup_slot, validated_items):
+    """Stage one order (and a period, if none is open) on the session.
+    The caller commits and handles IntegrityError."""
+    period = get_current_period()
     if not period:
         period = ActivePeriod()
         db.session.add(period)
@@ -323,30 +439,13 @@ def submit_order():
     )
     db.session.add(order)
     db.session.flush()
-
-    for item in items:
-        drink_id = item.get('drink_id')
-        if not isinstance(drink_id, int):
-            db.session.rollback()
-            return jsonify({'error': 'Each item must have a valid drink_id.'}), 400
-        drink = db.session.get(Drink, drink_id)
-        if not drink or not drink.enabled:
-            db.session.rollback()
-            return jsonify({'error': f'Drink {drink_id} is not available.'}), 400
-        order_item = OrderItem(
+    for drink_id, customizations in validated_items:
+        db.session.add(OrderItem(
             order_id=order.id,
             drink_id=drink_id,
-            customizations=item.get('customizations', {})
-        )
-        db.session.add(order_item)
-
-    db.session.commit()
-
-    return jsonify({
-        'order_number': order_num,
-        'confirmation_code': code,
-        'message': 'Order placed successfully.'
-    }), 201
+            customizations=customizations
+        ))
+    return order
 
 
 @public_bp.route('/orders/<confirmation_code>', methods=['GET'])
@@ -359,6 +458,10 @@ def get_order(confirmation_code):
         .first()
     )
     if not order:
+        return jsonify({'error': 'Order not found.'}), 404
+    # A13: orders from a closed session have been anonymized and exported;
+    # their ANON-<id> codes are not customer-facing.
+    if order.period is not None and order.period.ended_at is not None:
         return jsonify({'error': 'Order not found.'}), 404
 
     # Flag stale code lookups (>48 hours after order creation)

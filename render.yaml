@@ -30,5 +30,8 @@ services:
       # Neon Postgres connection string — pasted at Blueprint creation.
       - key: DATABASE_URL
         sync: false
+      # IANA zone used for "today" in location scheduling and auto-delete.
+      - key: BUSINESS_TIMEZONE
+        value: America/Los_Angeles
       - key: PYTHON_VERSION
         value: '3.13'

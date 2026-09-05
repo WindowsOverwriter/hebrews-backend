@@ -17,6 +17,7 @@ Flask-Limiter[memory]
 
 # Environment
 python-dotenv==1.1.0
+tzdata==2025.3
 
 # Testing
 pytest==8.3.5

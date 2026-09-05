@@ -11,7 +11,7 @@ from flask import Blueprint, jsonify, request, current_app
 from sqlalchemy.orm import joinedload
 from app import db, limiter
 from app.models import Order, OrderItem, Drink, DrinkCustomizationType, CustomizationOption, DrinkCustomizationOption, Setting, ActivePeriod, Location, LocationDate
-from app.routes.public import purge_expired_locations
+from app.routes.public import purge_expired_locations, get_current_period, PICKUP_SLOT_RE, HHMM_RE
 
 admin_bp = Blueprint('admin', __name__)
 
@@ -34,6 +34,62 @@ VALID_CUSTOMIZATION_TYPES = frozenset({
     'syrup',
 })
 MAX_CUSTOMIZATION_LABEL_LEN = 100
+MAX_DRINK_NAME_LEN = 100
+MAX_LOCATION_NAME_LEN = 150
+MAX_LOCATION_ADDRESS_LEN = 300
+MAX_SLOT_INTERVAL_MINUTES = 240
+
+_BAD_BODY = 'Request body must be a JSON object.'
+
+
+def _json_body():
+    """The request's JSON object, or None if the body is missing, null, or
+    not an object (A7: every handler used to 500 on `null`)."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+def _is_bool(value):
+    return isinstance(value, bool)
+
+
+def _slot_minutes(slot):
+    """'8:30 AM' -> 510. Unparseable slots sort last (A5)."""
+    m = PICKUP_SLOT_RE.match(slot or '')
+    if not m:
+        return 24 * 60
+    hour = int(m.group(1)) % 12 + (12 if m.group(3) == 'PM' else 0)
+    return hour * 60 + int(m.group(2))
+
+
+def _validate_customization_types(types):
+    """Return (deduped list, None) or (None, error). A10: types were stored
+    unchecked, so unknown names were accepted and duplicates 500'd."""
+    if not isinstance(types, list):
+        return None, 'customization_types must be a list.'
+    bad = [t for t in types if not isinstance(t, str) or t not in VALID_CUSTOMIZATION_TYPES]
+    if bad:
+        return None, f'Unknown customization type(s): {bad}. Valid types: {sorted(VALID_CUSTOMIZATION_TYPES)}'
+    return list(dict.fromkeys(types)), None
+
+
+def _validate_setting(key, value):
+    """Return (normalized value, None) or (None, error) for a whitelisted key.
+    A6: an unparseable business_hours_* value used to 500 the public /slots
+    endpoint and block every order."""
+    if key == 'orders_accepting':
+        if not _is_bool(value):
+            return None, 'orders_accepting must be true or false.'
+        return value, None
+    if key in ('business_hours_start', 'business_hours_end'):
+        if not isinstance(value, str) or not HHMM_RE.match(value.strip()):
+            return None, f'{key} must be a 24-hour time in HH:MM format.'
+        return value.strip(), None
+    if key == 'slot_interval_minutes':
+        if _is_bool(value) or not isinstance(value, int) or not 1 <= value <= MAX_SLOT_INTERVAL_MINUTES:
+            return None, f'slot_interval_minutes must be a whole number from 1 to {MAX_SLOT_INTERVAL_MINUTES}.'
+        return value, None
+    return None, 'Unknown setting key.'
 
 
 def require_auth(f):
@@ -44,10 +100,17 @@ def require_auth(f):
             return jsonify({'error': 'Missing or invalid token.'}), 401
         token = auth_header[7:]
         try:
-            jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
+            claims = jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token expired.'}), 401
         except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token.'}), 401
+        # A11: accept only tokens this app issued for the admin role, and only
+        # while the password they were issued under is still the current one.
+        if (
+            claims.get('role') != 'admin'
+            or claims.get('pwv') != current_app.config['ADMIN_PASSWORD_FINGERPRINT']
+        ):
             return jsonify({'error': 'Invalid token.'}), 401
         return f(*args, **kwargs)
     return decorated
@@ -56,18 +119,22 @@ def require_auth(f):
 @admin_bp.route('/login', methods=['POST'])
 @limiter.limit("5 per minute")
 def login():
-    data = request.get_json()
-    if not data or not data.get('password'):
+    data = _json_body()
+    password = data.get('password') if data else None
+    if not password or not isinstance(password, str):
         return jsonify({'error': 'Password is required.'}), 400
 
     stored_hash = current_app.config['ADMIN_PASSWORD_HASH']
-    if not bcrypt.checkpw(data['password'].encode('utf-8'), stored_hash):
+    if not bcrypt.checkpw(password.encode('utf-8'), stored_hash):
         return jsonify({'error': 'Invalid password.'}), 401
 
+    now = datetime.now(timezone.utc)
     token = jwt.encode(
         {
             'role': 'admin',
-            'exp': datetime.now(timezone.utc) + timedelta(hours=8)
+            'pwv': current_app.config['ADMIN_PASSWORD_FINGERPRINT'],
+            'iat': now,
+            'exp': now + timedelta(hours=8)
         },
         current_app.config['JWT_SECRET'],
         algorithm='HS256'
@@ -78,7 +145,7 @@ def login():
 @admin_bp.route('/orders', methods=['GET'])
 @require_auth
 def get_orders():
-    period = ActivePeriod.query.filter_by(ended_at=None).first()
+    period = get_current_period()
     if not period:
         return jsonify({'orders': []})
 
@@ -86,9 +153,11 @@ def get_orders():
         Order.query
         .filter_by(period_id=period.id)
         .options(joinedload(Order.items).joinedload(OrderItem.drink))
-        .order_by(Order.pickup_slot.asc())
         .all()
     )
+    # A5: pickup_slot is a display string; sorting it lexically put
+    # '10:00 AM' before '8:00 AM'. Sort by clock time, then arrival.
+    orders.sort(key=lambda o: (_slot_minutes(o.pickup_slot), o.id))
     return jsonify({
         'orders': [
             {
@@ -117,7 +186,9 @@ def get_orders():
 @require_auth
 def update_order_status(order_id):
     order = db.get_or_404(Order, order_id)
-    data = request.get_json()
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
     status = data.get('status')
     if status not in ('queued', 'received', 'completed'):
         return jsonify({'error': 'Invalid status.'}), 400
@@ -126,10 +197,26 @@ def update_order_status(order_id):
     return jsonify({'status': order.status})
 
 
+_TRACKED_CUSTOMIZATION_KEYS = ('temperature', 'espresso_type', 'milk_type', 'syrup')
+
+
+def _tally_customizations(custs, cust_counts):
+    """Accumulate {type: {label: count}} from one item's customizations.
+    Tolerates malformed rows (non-dict, or unhashable values) so a single
+    bad order can't break the dashboard for the whole period."""
+    if not isinstance(custs, dict):
+        return
+    for key in _TRACKED_CUSTOMIZATION_KEYS:
+        val = custs.get(key)
+        if val and isinstance(val, (str, int, float, bool)):
+            cust_counts.setdefault(key, {})
+            cust_counts[key][val] = cust_counts[key].get(val, 0) + 1
+
+
 @admin_bp.route('/trends', methods=['GET'])
 @require_auth
 def get_trends():
-    period = ActivePeriod.query.filter_by(ended_at=None).first()
+    period = get_current_period()
     if not period:
         return jsonify({'period_start': None, 'total_orders': 0, 'drinks': [], 'customizations': {}})
 
@@ -153,13 +240,7 @@ def get_trends():
 
     cust_counts = {}  # { type: { label: count } }
     for (custs,) in order_items:
-        if not custs:
-            continue
-        for key in ('temperature', 'espresso_type', 'milk_type', 'syrup'):
-            val = custs.get(key)
-            if val:
-                cust_counts.setdefault(key, {})
-                cust_counts[key][val] = cust_counts[key].get(val, 0) + 1
+        _tally_customizations(custs, cust_counts)
 
     total_orders = Order.query.filter_by(period_id=period.id).count()
 
@@ -177,20 +258,29 @@ def get_trends():
 @admin_bp.route('/period/reset', methods=['POST'])
 @require_auth
 def reset_period():
-    current_period = ActivePeriod.query.filter_by(ended_at=None).first()
-    if not current_period:
+    # A12: a race can leave more than one period open. Close all of them so
+    # the system self-heals; the newest is the one reported/exported.
+    open_periods = (
+        ActivePeriod.query
+        .filter_by(ended_at=None)
+        .order_by(ActivePeriod.id.desc())
+        .all()
+    )
+    if not open_periods:
         new_period = ActivePeriod()
         db.session.add(new_period)
         db.session.commit()
         return jsonify({'message': 'New period started.', 'export_file': None})
 
-    # Close the current period
-    current_period.ended_at = datetime.now(timezone.utc)
+    current_period = open_periods[0]
+    ended_at = datetime.now(timezone.utc)
+    for p in open_periods:
+        p.ended_at = ended_at
 
     # Gather orders for export before anonymizing
     orders = (
         Order.query
-        .filter_by(period_id=current_period.id)
+        .filter(Order.period_id.in_([p.id for p in open_periods]))
         .options(joinedload(Order.items).joinedload(OrderItem.drink))
         .all()
     )
@@ -218,12 +308,7 @@ def reset_period():
         for item in o.items:
             dname = item.drink.name if item.drink else 'Unknown'
             drink_counts[dname] = drink_counts.get(dname, 0) + 1
-            if item.customizations:
-                for key in ('temperature', 'espresso_type', 'milk_type', 'syrup'):
-                    val = item.customizations.get(key)
-                    if val:
-                        cust_counts.setdefault(key, {})
-                        cust_counts[key][val] = cust_counts[key].get(val, 0) + 1
+            _tally_customizations(item.customizations, cust_counts)
 
     export_data = {
         'period': {
@@ -262,7 +347,8 @@ def reset_period():
         o.customer_name = 'Anonymous'
         o.phone_number = ''
         o.confirmation_code = f'ANON-{o.id}'
-        o.order_number = 0
+        # order_number is kept: it is not PII, and zeroing it would violate
+        # UNIQUE(order_number, period_id) as soon as the period has 2+ orders.
 
     # Start new period
     new_period = ActivePeriod()
@@ -280,8 +366,13 @@ def reset_period():
 @require_auth
 def toggle_drink(drink_id):
     drink = db.get_or_404(Drink, drink_id)
-    data = request.get_json()
-    drink.enabled = data.get('enabled', drink.enabled)
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
+    if 'enabled' in data:
+        if not _is_bool(data['enabled']):
+            return jsonify({'error': 'enabled must be true or false.'}), 400
+        drink.enabled = data['enabled']
     db.session.commit()
     return jsonify({'id': drink.id, 'enabled': drink.enabled})
 
@@ -306,6 +397,8 @@ def update_customization(option_id):
             return jsonify({'error': f'A {option.type} option named "{label}" already exists.'}), 400
         option.label = label
     if 'enabled' in data:
+        if not _is_bool(data['enabled']):
+            return jsonify({'error': 'enabled must be true or false.'}), 400
         option.enabled = data['enabled']
     db.session.commit()
     return jsonify({
@@ -356,20 +449,34 @@ def delete_customization(option_id):
 @admin_bp.route('/drinks', methods=['POST'])
 @require_auth
 def create_drink():
-    data = request.get_json()
-    name = (data.get('name') or '').strip()
-    if not name:
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
+    name = data.get('name')
+    if not isinstance(name, str) or not name.strip():
         return jsonify({'error': 'name is required.'}), 400
+    name = name.strip()
+    if len(name) > MAX_DRINK_NAME_LEN:
+        return jsonify({'error': f'name must be {MAX_DRINK_NAME_LEN} characters or fewer.'}), 400
+    for field in ('description', 'ratio_summary'):
+        if data.get(field) is not None and not isinstance(data[field], str):
+            return jsonify({'error': f'{field} must be a string.'}), 400
+    enabled = data.get('enabled', True)
+    if not _is_bool(enabled):
+        return jsonify({'error': 'enabled must be true or false.'}), 400
+    types, type_error = _validate_customization_types(data.get('customization_types', []))
+    if type_error:
+        return jsonify({'error': type_error}), 400
+
     drink = Drink(
         name=name,
         description=(data.get('description') or '').strip(),
         ratio_summary=(data.get('ratio_summary') or '').strip(),
-        enabled=data.get('enabled', True)
+        enabled=enabled
     )
     db.session.add(drink)
     db.session.flush()
-    # Attach customization types if provided
-    for ct in data.get('customization_types', []):
+    for ct in types:
         db.session.add(DrinkCustomizationType(drink_id=drink.id, customization_type=ct))
     db.session.commit()
     return jsonify({
@@ -383,6 +490,18 @@ def create_drink():
 @require_auth
 def delete_drink(drink_id):
     drink = db.get_or_404(Drink, drink_id)
+    # order_items.drink_id has no ON DELETE rule, so Postgres raises an
+    # IntegrityError (500) if any order ever referenced this drink, and SQLite
+    # silently orphans the rows. Refuse cleanly and point the admin at the
+    # toggle instead -- order history must stay intact.
+    order_count = OrderItem.query.filter_by(drink_id=drink.id).count()
+    if order_count:
+        return jsonify({
+            'error': (
+                f'"{drink.name}" appears in {order_count} order item(s) and cannot be deleted. '
+                'Disable it to hide it from the menu instead.'
+            )
+        }), 409
     db.session.delete(drink)
     db.session.commit()
     return jsonify({'message': 'Drink deleted.'})
@@ -392,8 +511,12 @@ def delete_drink(drink_id):
 @require_auth
 def set_drink_customization_types(drink_id):
     drink = db.get_or_404(Drink, drink_id)
-    data = request.get_json()
-    types = data.get('types', [])
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
+    types, type_error = _validate_customization_types(data.get('types', []))
+    if type_error:
+        return jsonify({'error': type_error}), 400
     # Replace all
     DrinkCustomizationType.query.filter_by(drink_id=drink.id).delete()
     for ct in types:
@@ -535,13 +658,17 @@ def get_settings():
 @admin_bp.route('/settings', methods=['PATCH'])
 @require_auth
 def update_setting():
-    data = request.get_json()
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
     key = data.get('key')
-    value = data.get('value')
     if not key:
         return jsonify({'error': 'key is required.'}), 400
     if key not in VALID_SETTING_KEYS:
         return jsonify({'error': f'Unknown setting key. Valid keys: {sorted(VALID_SETTING_KEYS)}'}), 400
+    value, value_error = _validate_setting(key, data.get('value'))
+    if value_error:
+        return jsonify({'error': value_error}), 400
     setting = db.session.get(Setting, key)
     if not setting:
         setting = Setting(key=key, value=value)
@@ -578,11 +705,18 @@ def get_all_locations():
 @admin_bp.route('/locations', methods=['POST'])
 @require_auth
 def create_location():
-    data = request.get_json()
-    name = (data.get('name') or '').strip()
-    address = (data.get('address') or '').strip()
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
+    name = data.get('name')
+    address = data.get('address')
+    if not isinstance(name, str) or not isinstance(address, str):
+        return jsonify({'error': 'name and address must be strings.'}), 400
+    name, address = name.strip(), address.strip()
     if not name or not address:
         return jsonify({'error': 'name and address are required.'}), 400
+    if len(name) > MAX_LOCATION_NAME_LEN or len(address) > MAX_LOCATION_ADDRESS_LEN:
+        return jsonify({'error': f'name must be {MAX_LOCATION_NAME_LEN} and address {MAX_LOCATION_ADDRESS_LEN} characters or fewer.'}), 400
     location = Location(name=name, address=address)
     db.session.add(location)
     db.session.commit()
@@ -598,18 +732,45 @@ def create_location():
 @require_auth
 def update_location(location_id):
     location = db.get_or_404(Location, location_id)
-    data = request.get_json()
+    data = _json_body()
+    if data is None:
+        return jsonify({'error': _BAD_BODY}), 400
+
+    # A14: validate everything before mutating so a bad field can't leave a
+    # half-applied update or a 500.
+    updates = {}
     if 'name' in data:
-        location.name = data['name'].strip()
+        name = data['name']
+        if not isinstance(name, str) or not name.strip():
+            return jsonify({'error': 'name must be a non-empty string.'}), 400
+        if len(name.strip()) > MAX_LOCATION_NAME_LEN:
+            return jsonify({'error': f'name must be {MAX_LOCATION_NAME_LEN} characters or fewer.'}), 400
+        updates['name'] = name.strip()
     if 'address' in data:
-        location.address = data['address'].strip()
+        address = data['address']
+        if not isinstance(address, str) or not address.strip():
+            return jsonify({'error': 'address must be a non-empty string.'}), 400
+        if len(address.strip()) > MAX_LOCATION_ADDRESS_LEN:
+            return jsonify({'error': f'address must be {MAX_LOCATION_ADDRESS_LEN} characters or fewer.'}), 400
+        updates['address'] = address.strip()
     if 'active' in data:
-        location.active = data['active']
+        if not _is_bool(data['active']):
+            return jsonify({'error': 'active must be true or false.'}), 400
+        updates['active'] = data['active']
     if 'delete_after' in data:
-        if data['delete_after']:
-            location.delete_after = date.fromisoformat(data['delete_after'])
+        raw = data['delete_after']
+        if raw in (None, ''):
+            updates['delete_after'] = None
+        elif isinstance(raw, str):
+            try:
+                updates['delete_after'] = date.fromisoformat(raw)
+            except ValueError:
+                return jsonify({'error': f'Invalid delete_after "{raw}". Expected YYYY-MM-DD.'}), 400
         else:
-            location.delete_after = None
+            return jsonify({'error': 'delete_after must be a YYYY-MM-DD string or null.'}), 400
+
+    for field, value in updates.items():
+        setattr(location, field, value)
     db.session.commit()
     return jsonify({
         'id': location.id,
@@ -650,6 +811,7 @@ def set_location_dates(location_id):
         except ValueError:
             return jsonify({'error': f'Invalid date "{d}". Expected YYYY-MM-DD.'}), 400
 
+    parsed = list(dict.fromkeys(parsed))  # de-dup: duplicates would 500 on uq_location_date
     LocationDate.query.filter_by(location_id=location.id).delete()
     for parsed_date in parsed:
         db.session.add(LocationDate(location_id=location.id, date=parsed_date))

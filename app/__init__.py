@@ -1,6 +1,9 @@
+import hashlib
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import bcrypt as _bcrypt
 from flask import Flask
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_limiter import Limiter
@@ -48,11 +51,36 @@ def create_app(testing=False):
         admin_password = os.environ['ADMIN_PASSWORD']
         frontend_origin = os.environ['FRONTEND_ORIGIN']
 
+    # A9: calendar dates (location schedule, auto-delete, confirmation-code
+    # prefix) are computed in the business's local zone, not the server's.
+    # Render runs in UTC, which is already "tomorrow" in US evenings.
+    tz_name = os.environ.get('BUSINESS_TIMEZONE', 'America/Los_Angeles')
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise RuntimeError(
+            f"Refusing to start: BUSINESS_TIMEZONE '{tz_name}' is not a valid IANA zone name."
+        )
+    app.config['BUSINESS_TIMEZONE'] = tz_name
+
+    # A11: a short fingerprint of the admin password is embedded in every
+    # issued token, so rotating ADMIN_PASSWORD invalidates outstanding sessions.
+    app.config['ADMIN_PASSWORD_FINGERPRINT'] = hashlib.sha256(
+        admin_password.encode('utf-8')
+    ).hexdigest()[:16]
+
     # Hash the admin password once at startup for constant-time bcrypt comparison
     app.config['ADMIN_PASSWORD_HASH'] = _bcrypt.hashpw(
         admin_password.encode('utf-8'), _bcrypt.gensalt()
     )
     CORS(app, origins=[frontend_origin])
+
+    # Render (and any reverse proxy) terminates the client connection, so
+    # request.remote_addr would be the proxy's IP and every client would share
+    # one rate-limit bucket. Trust exactly one X-Forwarded-For hop so the
+    # limiter keys on the real client. Also applied in testing so the
+    # behavior is covered by tests.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
     db.init_app(app)
     limiter.init_app(app)
