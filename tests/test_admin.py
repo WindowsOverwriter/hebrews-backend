@@ -258,6 +258,41 @@ def test_omitting_type_clears_override(client, auth_headers):
     assert body['allowed_customization_options']['syrup'] == [4]
 
 
+def test_detaching_type_prunes_its_override(client, auth_headers):
+    # Drink 1 (Latte) is seeded with all four types. Set allowlists for
+    # temperature and syrup, then detach temperature: its allowlist must be
+    # pruned while the syrup allowlist survives.
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2], 'syrup': [4]},
+    }, headers=auth_headers)
+    resp = client.put('/api/admin/drinks/1/customization-types', json={
+        'types': ['espresso_type', 'milk_type', 'syrup'],
+    }, headers=auth_headers)
+    assert resp.status_code == 200
+
+    admin_drink = next(
+        d for d in client.get('/api/admin/menu', headers=auth_headers).get_json()['drinks']
+        if d['id'] == 1
+    )
+    assert admin_drink['allowed_customization_options'] == {'syrup': [4]}
+
+    public_drink = next(d for d in client.get('/api/menu').get_json()['drinks'] if d['id'] == 1)
+    assert public_drink['allowed_customization_options'] == {'syrup': [4]}
+
+
+def test_detaching_all_types_prunes_every_override(client, auth_headers):
+    client.put('/api/admin/drinks/1/customization-options', json={
+        'overrides': {'temperature': [2], 'syrup': [4]},
+    }, headers=auth_headers)
+    resp = client.put('/api/admin/drinks/1/customization-types', json={'types': []},
+                      headers=auth_headers)
+    assert resp.status_code == 200
+    menu = client.get('/api/menu').get_json()
+    drink1 = next(d for d in menu['drinks'] if d['id'] == 1)
+    assert drink1['customization_types'] == []
+    assert 'allowed_customization_options' not in drink1
+
+
 def test_override_rejects_unknown_type(client, auth_headers):
     resp = client.put('/api/admin/drinks/1/customization-options', json={
         'overrides': {'sweetener': [1]},

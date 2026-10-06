@@ -521,6 +521,23 @@ def set_drink_customization_types(drink_id):
     DrinkCustomizationType.query.filter_by(drink_id=drink.id).delete()
     for ct in types:
         db.session.add(DrinkCustomizationType(drink_id=drink.id, customization_type=ct))
+    # Prune per-drink option allowlists for types no longer attached. Left in
+    # place they are invisible in the admin UI but silently resurface (with
+    # stale contents) the moment the type is re-attached.
+    stale_option_ids = [
+        row.id for row in CustomizationOption.query
+        .filter(CustomizationOption.type.notin_(types) if types else True)
+        .all()
+    ]
+    if stale_option_ids:
+        (
+            DrinkCustomizationOption.query
+            .filter(
+                DrinkCustomizationOption.drink_id == drink.id,
+                DrinkCustomizationOption.customization_option_id.in_(stale_option_ids),
+            )
+            .delete(synchronize_session=False)
+        )
     db.session.commit()
     return jsonify({
         'customization_types': [ct.customization_type for ct in drink.customization_types]
