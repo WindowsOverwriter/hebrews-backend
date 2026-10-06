@@ -379,17 +379,46 @@ def reset_period():
 
 @admin_bp.route('/drinks/<int:drink_id>', methods=['PATCH'])
 @require_auth
-def toggle_drink(drink_id):
+def update_drink(drink_id):
+    """Partial update of a drink: name, description, ratio_summary, enabled.
+    Unknown keys are ignored. Everything is validated before anything is
+    mutated (A14 pattern) so a bad field can't leave a half-applied update."""
     drink = db.get_or_404(Drink, drink_id)
     data = _json_body()
     if data is None:
         return jsonify({'error': _BAD_BODY}), 400
+
+    updates = {}
+    if 'name' in data:
+        name = data['name']
+        if not isinstance(name, str) or not name.strip():
+            return jsonify({'error': 'name must be a non-empty string.'}), 400
+        if len(name.strip()) > MAX_DRINK_NAME_LEN:
+            return jsonify({'error': f'name must be {MAX_DRINK_NAME_LEN} characters or fewer.'}), 400
+        updates['name'] = name.strip()
+    for field in ('description', 'ratio_summary'):
+        if field in data:
+            value = data[field]
+            if value is None:
+                value = ''
+            if not isinstance(value, str):
+                return jsonify({'error': f'{field} must be a string.'}), 400
+            updates[field] = value.strip()
     if 'enabled' in data:
         if not _is_bool(data['enabled']):
             return jsonify({'error': 'enabled must be true or false.'}), 400
-        drink.enabled = data['enabled']
+        updates['enabled'] = data['enabled']
+
+    for field, value in updates.items():
+        setattr(drink, field, value)
     db.session.commit()
-    return jsonify({'id': drink.id, 'enabled': drink.enabled})
+    return jsonify({
+        'id': drink.id,
+        'name': drink.name,
+        'description': drink.description,
+        'ratio_summary': drink.ratio_summary,
+        'enabled': drink.enabled,
+    })
 
 
 @admin_bp.route('/customizations/<int:option_id>', methods=['PATCH'])

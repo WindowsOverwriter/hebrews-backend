@@ -29,6 +29,90 @@ def test_toggle_drink(client, auth_headers):
     assert response.get_json()['enabled'] is False
 
 
+# ─── Drink editing (PATCH /drinks/<id>) ───
+
+def test_update_drink_rename(client, auth_headers):
+    response = client.patch('/api/admin/drinks/1', json={'name': '  Caffe Latte '}, headers=auth_headers)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['name'] == 'Caffe Latte'
+    assert body['id'] == 1
+    assert body['enabled'] is True
+
+
+def test_update_drink_description_and_ratio(client, auth_headers):
+    response = client.patch('/api/admin/drinks/1', json={
+        'description': ' Smooth and creamy ',
+        'ratio_summary': '60% milk, 40% espresso',
+    }, headers=auth_headers)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['description'] == 'Smooth and creamy'
+    assert body['ratio_summary'] == '60% milk, 40% espresso'
+
+
+def test_update_drink_partial_leaves_other_fields(client, auth_headers):
+    before = client.get('/api/admin/menu', headers=auth_headers).get_json()
+    drink_before = next(d for d in before['drinks'] if d['id'] == 1)
+    client.patch('/api/admin/drinks/1', json={'description': 'Only this changed'}, headers=auth_headers)
+    after = client.get('/api/admin/menu', headers=auth_headers).get_json()
+    drink_after = next(d for d in after['drinks'] if d['id'] == 1)
+    assert drink_after['description'] == 'Only this changed'
+    assert drink_after['name'] == drink_before['name']
+    assert drink_after['ratio_summary'] == drink_before['ratio_summary']
+    assert drink_after['enabled'] == drink_before['enabled']
+
+
+def test_update_drink_rejects_empty_name(client, auth_headers):
+    assert client.patch('/api/admin/drinks/1', json={'name': ''}, headers=auth_headers).status_code == 400
+    assert client.patch('/api/admin/drinks/1', json={'name': '   '}, headers=auth_headers).status_code == 400
+    assert client.patch('/api/admin/drinks/1', json={'name': None}, headers=auth_headers).status_code == 400
+    # Nothing mutated
+    menu = client.get('/api/admin/menu', headers=auth_headers).get_json()
+    assert next(d for d in menu['drinks'] if d['id'] == 1)['name'] == 'Latte'
+
+
+def test_update_drink_rejects_long_name(client, auth_headers):
+    response = client.patch('/api/admin/drinks/1', json={'name': 'x' * 101}, headers=auth_headers)
+    assert response.status_code == 400
+
+
+def test_update_drink_rejects_non_string_description(client, auth_headers):
+    assert client.patch('/api/admin/drinks/1', json={'description': 42}, headers=auth_headers).status_code == 400
+    assert client.patch('/api/admin/drinks/1', json={'ratio_summary': ['a']}, headers=auth_headers).status_code == 400
+
+
+def test_update_drink_rejects_non_bool_enabled(client, auth_headers):
+    assert client.patch('/api/admin/drinks/1', json={'enabled': 'no'}, headers=auth_headers).status_code == 400
+
+
+def test_update_drink_bad_field_blocks_whole_update(client, auth_headers):
+    # A valid name alongside an invalid enabled must apply nothing.
+    response = client.patch('/api/admin/drinks/1', json={'name': 'Renamed', 'enabled': 'no'}, headers=auth_headers)
+    assert response.status_code == 400
+    menu = client.get('/api/admin/menu', headers=auth_headers).get_json()
+    assert next(d for d in menu['drinks'] if d['id'] == 1)['name'] == 'Latte'
+
+
+def test_update_drink_unknown_id(client, auth_headers):
+    assert client.patch('/api/admin/drinks/9999', json={'name': 'Ghost'}, headers=auth_headers).status_code == 404
+
+
+def test_update_drink_requires_auth(client):
+    assert client.patch('/api/admin/drinks/1', json={'name': 'Nope'}).status_code == 401
+
+
+def test_update_drink_reflected_in_public_menu(client, auth_headers):
+    client.patch('/api/admin/drinks/1', json={
+        'name': 'Flat White',
+        'ratio_summary': 'Double ristretto, velvety milk',
+    }, headers=auth_headers)
+    menu = client.get('/api/menu').get_json()
+    drink = next(d for d in menu['drinks'] if d['id'] == 1)
+    assert drink['name'] == 'Flat White'
+    assert drink['ratio_summary'] == 'Double ristretto, velvety milk'
+
+
 def test_update_setting(client, auth_headers):
     response = client.patch('/api/admin/settings', json={
         'key': 'orders_accepting',
