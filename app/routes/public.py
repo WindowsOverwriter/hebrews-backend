@@ -459,8 +459,8 @@ def get_order(confirmation_code):
     )
     if not order:
         return jsonify({'error': 'Order not found.'}), 404
-    # A13: orders from a closed session have been anonymized and exported;
-    # their ANON-<id> codes are not customer-facing.
+    # A13: a reset deletes a closed session's orders, but guard against any
+    # row that survives (e.g. a period closed by hand) -- it is not customer-facing.
     if order.period is not None and order.period.ended_at is not None:
         return jsonify({'error': 'Order not found.'}), 404
 

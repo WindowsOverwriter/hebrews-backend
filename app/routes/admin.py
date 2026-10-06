@@ -1,8 +1,5 @@
-import json
-import os
 from functools import wraps
 from datetime import datetime, timezone, timedelta, date
-from pathlib import Path
 
 import bcrypt
 import jwt
@@ -255,38 +252,39 @@ def get_trends():
     })
 
 
-@admin_bp.route('/period/reset', methods=['POST'])
-@require_auth
-def reset_period():
-    # A12: a race can leave more than one period open. Close all of them so
-    # the system self-heals; the newest is the one reported/exported.
-    open_periods = (
+def _open_periods():
+    """All currently open periods, newest first. A race can leave more than
+    one open (A12); callers treat the newest as the one reported."""
+    return (
         ActivePeriod.query
         .filter_by(ended_at=None)
         .order_by(ActivePeriod.id.desc())
         .all()
     )
-    if not open_periods:
-        new_period = ActivePeriod()
-        db.session.add(new_period)
-        db.session.commit()
-        return jsonify({'message': 'New period started.', 'export_file': None})
 
-    current_period = open_periods[0]
-    ended_at = datetime.now(timezone.utc)
-    for p in open_periods:
-        p.ended_at = ended_at
 
-    # Gather orders for export before anonymizing
-    orders = (
+def _orders_for_periods(periods):
+    if not periods:
+        return []
+    return (
         Order.query
-        .filter(Order.period_id.in_([p.id for p in open_periods]))
+        .filter(Order.period_id.in_([p.id for p in periods]))
         .options(joinedload(Order.items).joinedload(OrderItem.drink))
+        .order_by(Order.id)
         .all()
     )
 
-    # Build anonymized export data
+
+def _build_period_export(periods, orders):
+    """Anonymized export of `orders` for the session described by `periods`
+    (newest first). Contains no customer_name, phone_number, or
+    confirmation_code. This JSON is the only record that survives a reset:
+    the orders themselves are deleted from the database."""
+    period = periods[0] if periods else None
+
     export_orders = []
+    drink_counts = {}
+    cust_counts = {}
     for o in orders:
         export_orders.append({
             'pickup_slot': o.pickup_slot,
@@ -300,22 +298,17 @@ def reset_period():
                 for item in o.items
             ]
         })
-
-    # Aggregate stats for the summary
-    drink_counts = {}
-    cust_counts = {}
-    for o in orders:
         for item in o.items:
             dname = item.drink.name if item.drink else 'Unknown'
             drink_counts[dname] = drink_counts.get(dname, 0) + 1
             _tally_customizations(item.customizations, cust_counts)
 
-    export_data = {
+    return {
         'period': {
-            'id': current_period.id,
-            'started_at': current_period.started_at.isoformat() if current_period.started_at else None,
-            'ended_at': current_period.ended_at.isoformat()
-        },
+            'id': period.id,
+            'started_at': period.started_at.isoformat() if period.started_at else None,
+            'ended_at': period.ended_at.isoformat() if period.ended_at else None,
+        } if period else None,
         'summary': {
             'total_orders': len(orders),
             'drinks': sorted(
@@ -333,32 +326,54 @@ def reset_period():
         'orders': export_orders
     }
 
-    # Write export file
-    exports_dir = Path(current_app.root_path).parent / 'exports'
-    exports_dir.mkdir(exist_ok=True)
-    date_str = current_period.ended_at.strftime('%Y-%m-%d_%H%M%S')
-    filename = f'period-{current_period.id}-{date_str}.json'
-    filepath = exports_dir / filename
-    with open(filepath, 'w') as f:
-        json.dump(export_data, f, indent=2)
 
-    # Anonymize orders in the database
-    for o in orders:
-        o.customer_name = 'Anonymous'
-        o.phone_number = ''
-        o.confirmation_code = f'ANON-{o.id}'
-        # order_number is kept: it is not PII, and zeroing it would violate
-        # UNIQUE(order_number, period_id) as soon as the period has 2+ orders.
+@admin_bp.route('/period/export', methods=['GET'])
+@require_auth
+def get_period_export():
+    """Preview of what a reset would export. Read-only."""
+    periods = _open_periods()
+    return jsonify(_build_period_export(periods, _orders_for_periods(periods)))
 
-    # Start new period
+
+@admin_bp.route('/period/reset', methods=['POST'])
+@require_auth
+def reset_period():
+    """End the session: close every open period, delete its orders, and
+    start a new period. The response carries the anonymized export; nothing
+    is written to disk, so the client's download is the only lasting record."""
+    open_periods = _open_periods()
+    if not open_periods:
+        new_period = ActivePeriod()
+        db.session.add(new_period)
+        db.session.commit()
+        return jsonify({
+            'message': 'New period started.',
+            'total_orders': 0,
+            'export': _build_period_export([], []),
+        })
+
+    ended_at = datetime.now(timezone.utc)
+    for p in open_periods:
+        p.ended_at = ended_at
+
+    orders = _orders_for_periods(open_periods)
+    export_data = _build_period_export(open_periods, orders)
+
+    # Delete the orders outright (items first: order_items.order_id has no
+    # ON DELETE rule). The export above is the only copy that survives.
+    order_ids = [o.id for o in orders]
+    if order_ids:
+        OrderItem.query.filter(OrderItem.order_id.in_(order_ids)).delete(synchronize_session=False)
+        Order.query.filter(Order.id.in_(order_ids)).delete(synchronize_session=False)
+
     new_period = ActivePeriod()
     db.session.add(new_period)
     db.session.commit()
 
     return jsonify({
-        'message': 'Session ended. Data exported and anonymized.',
-        'export_file': filename,
-        'total_orders': len(orders)
+        'message': 'Session ended. Orders deleted.',
+        'total_orders': len(orders),
+        'export': export_data,
     })
 
 

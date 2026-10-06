@@ -65,8 +65,15 @@ def test_reset_period(client, auth_headers):
     response = client.post('/api/admin/period/reset', headers=auth_headers)
     assert response.status_code == 200
     data = response.get_json()
-    assert 'message' in data
-    assert 'export' in data['message'].lower() or 'period' in data['message'].lower()
+    assert data['message'] == 'Session ended. Orders deleted.'
+    assert data['total_orders'] == 0
+    assert data['export']['orders'] == []
+    assert data['export']['summary']['total_orders'] == 0
+    assert data['export']['period']['ended_at'] is not None
+
+
+def test_reset_period_requires_auth(client):
+    assert client.post('/api/admin/period/reset').status_code == 401
 
 
 def test_get_trends(client, auth_headers):
@@ -361,22 +368,91 @@ def _place_order(client, slot='9:00 AM', drink_id=1, customizations=None):
     })
 
 
-def test_reset_period_with_multiple_orders(client, auth_headers):
-    """Anonymizing two orders in one period must not collide on
-    UNIQUE(order_number, period_id)."""
+def test_reset_period_deletes_orders_and_returns_export(client, auth_headers, app):
+    """A reset removes the closed period's orders and items from the database.
+    The export in the response is the only remaining record, and it carries
+    no customer name, phone number, or confirmation code."""
+    import json
+    from app import db
+    from app.models import Order, OrderItem, ActivePeriod
     assert _place_order(client, '8:00 AM').status_code == 201
-    assert _place_order(client, '9:00 AM').status_code == 201
+    assert _place_order(client, '9:00 AM', customizations={'syrup': 'Vanilla'}).status_code == 201
+    with app.app_context():
+        old_period_id = ActivePeriod.query.filter_by(ended_at=None).one().id
+        assert OrderItem.query.count() == 2
 
     response = client.post('/api/admin/period/reset', headers=auth_headers)
     assert response.status_code == 200
-    assert response.get_json()['total_orders'] == 2
+    data = response.get_json()
+    assert data['total_orders'] == 2
+    assert 'export_file' not in data
 
-    # New period is empty and the old orders were anonymized in place.
+    export = data['export']
+    assert export['period']['id'] == old_period_id
+    assert export['period']['ended_at'] is not None
+    assert export['summary']['total_orders'] == 2
+    assert len(export['orders']) == 2
+    assert {o['pickup_slot'] for o in export['orders']} == {'8:00 AM', '9:00 AM'}
+    assert export['orders'][0]['items'][0]['drink_name']
+    blob = json.dumps(export)
+    assert 'Audit Tester' not in blob
+    assert '5551234567' not in blob
+    assert 'confirmation_code' not in blob
+    assert 'customer_name' not in blob
+    assert 'phone_number' not in blob
+
+    # Rows are gone, not anonymized; the closed period row itself survives.
     assert client.get('/api/admin/orders', headers=auth_headers).get_json()['orders'] == []
-    from app.models import Order
-    names = {o.customer_name for o in Order.query.all()}
-    assert names == {'Anonymous'}
-    assert all(o.confirmation_code.startswith('ANON-') for o in Order.query.all())
+    with app.app_context():
+        assert Order.query.count() == 0
+        assert OrderItem.query.count() == 0
+        closed = db.session.get(ActivePeriod, old_period_id)
+        assert closed is not None and closed.ended_at is not None
+        new_period = ActivePeriod.query.filter_by(ended_at=None).one()
+        assert new_period.id != old_period_id
+        assert Order.query.filter_by(period_id=new_period.id).count() == 0
+
+
+def test_period_export_preview_is_read_only(client, auth_headers, app):
+    import json
+    from app.models import Order, OrderItem
+    assert _place_order(client, '8:00 AM').status_code == 201
+
+    response = client.get('/api/admin/period/export', headers=auth_headers)
+    assert response.status_code == 200
+    export = response.get_json()
+    assert export['period']['ended_at'] is None
+    assert export['summary']['total_orders'] == 1
+    assert len(export['orders']) == 1
+    assert export['orders'][0]['pickup_slot'] == '8:00 AM'
+    blob = json.dumps(export)
+    assert 'Audit Tester' not in blob and '5551234567' not in blob
+
+    # Nothing was deleted or closed.
+    with app.app_context():
+        assert Order.query.count() == 1
+        assert OrderItem.query.count() == 1
+    assert len(client.get('/api/admin/orders', headers=auth_headers).get_json()['orders']) == 1
+
+
+def test_period_export_requires_auth(client):
+    assert client.get('/api/admin/period/export').status_code == 401
+
+
+def test_period_export_with_no_open_period(client, auth_headers, app):
+    from datetime import datetime, timezone
+    from app import db
+    from app.models import ActivePeriod
+    with app.app_context():
+        for p in ActivePeriod.query.filter_by(ended_at=None).all():
+            p.ended_at = datetime.now(timezone.utc)
+        db.session.commit()
+    response = client.get('/api/admin/period/export', headers=auth_headers)
+    assert response.status_code == 200
+    export = response.get_json()
+    assert export['period'] is None
+    assert export['orders'] == []
+    assert export['summary']['total_orders'] == 0
 
 
 def test_trends_and_reset_tolerate_malformed_customizations(client, auth_headers, app):
@@ -586,13 +662,12 @@ def test_reset_closes_every_open_period(client, auth_headers, app):
         assert ActivePeriod.query.filter_by(ended_at=None).count() == 1
 
 
-def test_anonymized_order_not_publicly_readable(client, auth_headers):
-    """A13"""
+def test_deleted_order_not_publicly_readable(client, auth_headers):
+    """A13: once the session is reset the order no longer exists."""
     code = _place_order(client).get_json()['confirmation_code']
     assert client.get(f'/api/orders/{code}').status_code == 200
     client.post('/api/admin/period/reset', headers=auth_headers)
     assert client.get(f'/api/orders/{code}').status_code == 404
-    assert client.get('/api/orders/ANON-1').status_code == 404
 
 
 def test_boolean_fields_validated(client, auth_headers):
