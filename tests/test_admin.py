@@ -134,6 +134,7 @@ def test_orders_rejected_when_disabled(client, auth_headers):
         'customer_name': 'Test',
         'phone_number': '5551234567',
         'pickup_slot': '9:00 AM',
+        'location_id': 1,
         'items': [{'drink_id': 1, 'customizations': {}}]
     })
     assert response.status_code == 503
@@ -443,11 +444,12 @@ def test_admin_menu_customizations_sorted_by_creation(client, auth_headers):
 # Audit fixes (2026-09-04)
 # ---------------------------------------------------------------------------
 
-def _place_order(client, slot='9:00 AM', drink_id=1, customizations=None):
+def _place_order(client, slot='9:00 AM', drink_id=1, customizations=None, location_id=1):
     return client.post('/api/orders', json={
         'customer_name': 'Audit Tester',
         'phone_number': '5551234567',
         'pickup_slot': slot,
+        'location_id': location_id,
         'items': [{'drink_id': drink_id, 'customizations': customizations or {'milk_type': 'Oat'}}],
     })
 
@@ -592,10 +594,10 @@ def test_login_rate_limit_keys_on_forwarded_client_ip(client):
 
 def test_admin_orders_sorted_by_clock_time(client, auth_headers):
     """A5: lexical sort put '10:00 AM' before '8:00 AM'."""
-    for slot in ['10:00 AM', '12:00 PM', '1:00 PM', '8:00 AM', '9:30 AM']:
+    for slot in ['10:00 AM', '1:00 PM', '2:00 PM', '8:00 AM', '9:30 AM']:
         assert _place_order(client, slot).status_code == 201
     slots = [o['pickup_slot'] for o in client.get('/api/admin/orders', headers=auth_headers).get_json()['orders']]
-    assert slots == ['8:00 AM', '9:30 AM', '10:00 AM', '12:00 PM', '1:00 PM']
+    assert slots == ['8:00 AM', '9:30 AM', '10:00 AM', '1:00 PM', '2:00 PM']
 
 
 def test_setting_rejects_bad_business_hours(client, auth_headers):
@@ -618,8 +620,11 @@ def test_setting_rejects_bad_interval_and_flag(client, auth_headers):
     assert r.status_code == 400
 
 
-def test_setting_accepts_frontend_values(client, auth_headers):
+def test_setting_accepts_frontend_values(client, auth_headers, monkeypatch):
     """A6: the admin UI sends HH:MM strings, ints, and booleans."""
+    from tests.conftest import freeze_business_time
+    # The default freeze is 07:30, which would hide the 7:30 AM slot itself.
+    freeze_business_time(monkeypatch, 7, 0)
     ok = [('business_hours_start', '07:30'), ('business_hours_end', '18:00'),
           ('slot_interval_minutes', 30), ('orders_accepting', True)]
     for key, value in ok:
@@ -681,10 +686,11 @@ def test_location_delete_after_semantics(client, auth_headers, app):
         db.session.commit()
 
     public = {l['name'] for l in client.get('/api/locations').get_json()['locations']}
-    assert public == {'Ends Today', 'Ends Tomorrow'}
+    # 'Main Street Pop-up' is the seeded location every order test uses.
+    assert public == {'Main Street Pop-up', 'Ends Today', 'Ends Tomorrow'}
 
     admin = {l['name'] for l in client.get('/api/admin/locations', headers=auth_headers).get_json()['locations']}
-    assert admin == {'Ends Today', 'Ends Tomorrow'}  # yesterday's was purged
+    assert admin == {'Main Street Pop-up', 'Ends Today', 'Ends Tomorrow'}  # yesterday's was purged
 
 
 def test_business_today_uses_configured_timezone(app):
@@ -780,3 +786,50 @@ def test_location_dates_dedup(client, auth_headers):
                    json={'dates': ['2026-10-01', '2026-10-01', '2026-10-02']})
     assert r.status_code == 200
     assert r.get_json()['dates'] == ['2026-10-01', '2026-10-02']
+
+
+# ---------------------------------------------------------------------------
+# Orders record their location
+# ---------------------------------------------------------------------------
+
+def test_admin_orders_include_location(client, auth_headers):
+    assert _place_order(client).status_code == 201
+    orders = client.get('/api/admin/orders', headers=auth_headers).get_json()['orders']
+    assert len(orders) == 1
+    assert orders[0]['location_id'] == 1
+    assert orders[0]['location_name'] == 'Main Street Pop-up'
+
+
+def test_admin_orders_distinguish_locations_open_same_day(client, auth_headers):
+    second = client.post('/api/admin/locations', headers=auth_headers,
+                         json={'name': 'Riverside', 'address': 'R'}).get_json()['id']
+    assert _place_order(client, '8:00 AM', location_id=1).status_code == 201
+    assert _place_order(client, '8:00 AM', location_id=second).status_code == 201
+    orders = client.get('/api/admin/orders', headers=auth_headers).get_json()['orders']
+    assert [(o['location_id'], o['location_name']) for o in orders] == [
+        (1, 'Main Street Pop-up'), (second, 'Riverside'),
+    ]
+
+
+def test_delete_location_detaches_orders(client, auth_headers, app):
+    from app.models import Order
+    code = _place_order(client).get_json()['confirmation_code']
+    assert client.delete('/api/admin/locations/1', headers=auth_headers).status_code == 200
+
+    orders = client.get('/api/admin/orders', headers=auth_headers).get_json()['orders']
+    assert len(orders) == 1
+    assert orders[0]['confirmation_code'] == code
+    assert orders[0]['location_id'] is None
+    assert orders[0]['location_name'] is None
+    with app.app_context():
+        assert Order.query.count() == 1
+    # Deleting an unreferenced location still works and orders are untouched.
+    assert client.delete('/api/admin/locations/1', headers=auth_headers).status_code == 404
+
+
+def test_period_export_includes_location_name(client, auth_headers):
+    assert _place_order(client).status_code == 201
+    export = client.get('/api/admin/period/export', headers=auth_headers).get_json()
+    assert export['orders'][0]['location_name'] == 'Main Street Pop-up'
+    reset = client.post('/api/admin/period/reset', headers=auth_headers).get_json()
+    assert reset['export']['orders'][0]['location_name'] == 'Main Street Pop-up'

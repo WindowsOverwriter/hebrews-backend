@@ -80,10 +80,24 @@ _MAX_ORDER_ATTEMPTS = 3
 public_bp = Blueprint('public', __name__)
 
 
+# The cart closes for lunch daily: no pickup slots are offered or accepted
+# whose start minute is >= LUNCH_BREAK_START_MINUTES and < LUNCH_BREAK_END_MINUTES.
+# 11:45 AM and 1:00 PM are still offered; 12:00-12:45 PM are not.
+LUNCH_BREAK_START_MINUTES = 12 * 60
+LUNCH_BREAK_END_MINUTES = 13 * 60
+
+
+def business_now():
+    """Current aware datetime in the business's timezone (BUSINESS_TIMEZONE),
+    not the server's. Every 'now' lookup for slots goes through here so tests
+    can freeze it (see tests/conftest.py)."""
+    return datetime.now(ZoneInfo(current_app.config['BUSINESS_TIMEZONE']))
+
+
 def business_today():
     """Calendar date in the business's timezone (BUSINESS_TIMEZONE), not the
     server's. Use this for anything that means 'today' to a customer."""
-    return datetime.now(ZoneInfo(current_app.config['BUSINESS_TIMEZONE'])).date()
+    return business_now().date()
 
 
 def get_current_period():
@@ -167,8 +181,10 @@ def get_menu():
     })
 
 
-@public_bp.route('/slots', methods=['GET'])
-def get_slots():
+def available_slots():
+    """Pickup slots a customer may choose right now, as display strings
+    ('8:30 AM'). Single source of truth for GET /slots and the pickup_slot
+    check in submit_order."""
     start_setting = db.session.get(Setting, 'business_hours_start')
     end_setting = db.session.get(Setting, 'business_hours_end')
     interval_setting = db.session.get(Setting, 'slot_interval_minutes')
@@ -187,10 +203,21 @@ def get_slots():
     if interval <= 0:
         interval = 15
 
+    # Slots whose start time has already passed (business-local) are gone.
+    # Boundary is inclusive: the 9:00 AM slot disappears at 9:00:00.
+    now = business_now()
+    now_minutes = now.hour * 60 + now.minute
+
     slots = []
     current = start_minutes
     # m16: closing time is not a valid pickup slot — use < not <=
     while current < end_minutes:
+        if current <= now_minutes:
+            current += interval
+            continue
+        if LUNCH_BREAK_START_MINUTES <= current < LUNCH_BREAK_END_MINUTES:
+            current += interval
+            continue
         h, m = divmod(current, 60)
         period = 'AM' if h < 12 else 'PM'
         display_h = h if h <= 12 else h - 12
@@ -199,7 +226,12 @@ def get_slots():
         slots.append(f'{display_h}:{m:02d} {period}')
         current += interval
 
-    return jsonify({'slots': slots})
+    return slots
+
+
+@public_bp.route('/slots', methods=['GET'])
+def get_slots():
+    return jsonify({'slots': available_slots()})
 
 
 # Patterns checked against the full code (prefix + suffix) with dash removed.
@@ -300,6 +332,11 @@ def purge_expired_locations():
         Location.delete_after < today
     ).all()
     for loc in expired:
+        # Detach the location's orders explicitly: SQLite (tests, local dev)
+        # does not enforce the ON DELETE SET NULL on orders.location_id.
+        Order.query.filter_by(location_id=loc.id).update(
+            {'location_id': None}, synchronize_session=False
+        )
         db.session.delete(loc)
     return len(expired)
 
@@ -369,6 +406,11 @@ def submit_order():
         return jsonify({'error': 'pickup_slot must be 20 characters or fewer.'}), 400
     if not PICKUP_SLOT_RE.match(pickup_slot):
         return jsonify({'error': 'pickup_slot must look like "8:30 AM" or "12:15 PM".'}), 400
+    # The slot must be one we would offer right now: this one check rejects
+    # slots that have already passed, lunch-gap slots, out-of-hours slots, and
+    # off-grid times like "9:05 AM". Wording is shown to customers as-is.
+    if pickup_slot not in available_slots():
+        return jsonify({'error': 'That pickup time is no longer available. Please choose another time.'}), 400
     if not _PHONE_ALLOWED_RE.match(phone_number) or sum(c.isdigit() for c in phone_number) < 7:
         return jsonify({'error': 'phone_number must contain 7–15 digits with only digits, spaces, dashes, parens, dots, or a leading +.'}), 400
     if not isinstance(items, list):
@@ -377,6 +419,21 @@ def submit_order():
         return jsonify({'error': 'At least one item is required.'}), 400
     if len(items) > 20:
         return jsonify({'error': 'Maximum 20 items per order.'}), 400
+
+    # Several locations can be open on the same day, so every order records
+    # which one it is for. Same availability rules as GET /locations.
+    location_id = data.get('location_id')
+    if location_id is None:
+        return jsonify({'error': 'location_id is required.'}), 400
+    if not isinstance(location_id, int) or isinstance(location_id, bool):
+        return jsonify({'error': 'location_id must be an integer.'}), 400
+    location = db.session.get(Location, location_id)
+    if (
+        not location
+        or not location.active
+        or (location.delete_after is not None and location.delete_after < business_today())
+    ):
+        return jsonify({'error': f'Location {location_id} is not available.'}), 400
 
     # Validate every item before writing anything, so the insert below is a
     # short transaction that can be retried wholesale.
@@ -401,7 +458,7 @@ def submit_order():
     order = None
     for attempt in range(_MAX_ORDER_ATTEMPTS):
         try:
-            order = _create_order(customer_name, phone_number, pickup_slot, validated_items)
+            order = _create_order(customer_name, phone_number, pickup_slot, location_id, validated_items)
             db.session.commit()
             break
         except IntegrityError:
@@ -418,7 +475,7 @@ def submit_order():
     }), 201
 
 
-def _create_order(customer_name, phone_number, pickup_slot, validated_items):
+def _create_order(customer_name, phone_number, pickup_slot, location_id, validated_items):
     """Stage one order (and a period, if none is open) on the session.
     The caller commits and handles IntegrityError."""
     period = get_current_period()
@@ -435,7 +492,8 @@ def _create_order(customer_name, phone_number, pickup_slot, validated_items):
         customer_name=customer_name,
         phone_number=phone_number,
         pickup_slot=pickup_slot,
-        period_id=period.id
+        period_id=period.id,
+        location_id=location_id
     )
     db.session.add(order)
     db.session.flush()
@@ -454,7 +512,10 @@ def get_order(confirmation_code):
     order = (
         Order.query
         .filter_by(confirmation_code=confirmation_code.upper())
-        .options(joinedload(Order.items).joinedload(OrderItem.drink))
+        .options(
+            joinedload(Order.items).joinedload(OrderItem.drink),
+            joinedload(Order.location),
+        )
         .first()
     )
     if not order:
@@ -485,6 +546,7 @@ def get_order(confirmation_code):
         'customer_name': first_name,
         'pickup_slot': order.pickup_slot,
         'status': order.status,
+        'location_name': order.location.name if order.location else None,
         'items': [
             {
                 'drink_name': item.drink.name if item.drink else 'Unknown',

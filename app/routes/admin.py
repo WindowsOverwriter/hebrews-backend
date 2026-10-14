@@ -149,7 +149,10 @@ def get_orders():
     orders = (
         Order.query
         .filter_by(period_id=period.id)
-        .options(joinedload(Order.items).joinedload(OrderItem.drink))
+        .options(
+            joinedload(Order.items).joinedload(OrderItem.drink),
+            joinedload(Order.location),
+        )
         .all()
     )
     # A5: pickup_slot is a display string; sorting it lexically put
@@ -165,6 +168,8 @@ def get_orders():
                 'phone_number': o.phone_number,
                 'pickup_slot': o.pickup_slot,
                 'status': o.status,
+                'location_id': o.location_id,
+                'location_name': o.location.name if o.location else None,
                 'items': [
                     {
                         'drink_name': item.drink.name if item.drink else 'Unknown',
@@ -269,7 +274,10 @@ def _orders_for_periods(periods):
     return (
         Order.query
         .filter(Order.period_id.in_([p.id for p in periods]))
-        .options(joinedload(Order.items).joinedload(OrderItem.drink))
+        .options(
+            joinedload(Order.items).joinedload(OrderItem.drink),
+            joinedload(Order.location),
+        )
         .order_by(Order.id)
         .all()
     )
@@ -289,6 +297,7 @@ def _build_period_export(periods, orders):
         export_orders.append({
             'pickup_slot': o.pickup_slot,
             'status': o.status,
+            'location_name': o.location.name if o.location else None,
             'created_at': o.created_at.isoformat() if o.created_at else None,
             'items': [
                 {
@@ -846,6 +855,11 @@ def update_location(location_id):
 @require_auth
 def delete_location(location_id):
     location = db.get_or_404(Location, location_id)
+    # Orders keep their history but lose the link. Done explicitly because
+    # SQLite does not enforce ON DELETE SET NULL on orders.location_id.
+    Order.query.filter_by(location_id=location.id).update(
+        {'location_id': None}, synchronize_session=False
+    )
     db.session.delete(location)
     db.session.commit()
     return jsonify({'message': 'Location deleted.'})

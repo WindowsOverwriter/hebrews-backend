@@ -76,9 +76,14 @@ class Order(db.Model):
     pickup_slot = db.Column(db.String(20), nullable=False)
     status = db.Column(db.String(20), default='queued')
     period_id = db.Column(db.Integer, db.ForeignKey('active_periods.id'), nullable=False)
+    # Which location the order is for. Nullable: orders placed before this
+    # column existed have none, and deleting a location detaches its orders
+    # rather than deleting them.
+    location_id = db.Column(db.Integer, db.ForeignKey('locations.id', ondelete='SET NULL'), nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     items = db.relationship('OrderItem', backref='order', lazy=True, cascade='all, delete-orphan')
+    location = db.relationship('Location', lazy=True)
 
     __table_args__ = (
         db.UniqueConstraint('order_number', 'period_id', name='uq_order_number_period'),
